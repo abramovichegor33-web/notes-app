@@ -48,6 +48,7 @@ class _NotesScreenState extends State<NotesScreen> {
   String _searchQuery = '';
   Note? _selectedNote;
   RealtimeChannel? _realtimeChannel;
+  Timer? _periodicSyncTimer;
 
   @override
   void initState() {
@@ -55,6 +56,56 @@ class _NotesScreenState extends State<NotesScreen> {
     WebPasteListener.setNewNoteHandler(_createNewNote);
     _fetchNotes();
     _setupRealtime();
+    _startPeriodicSync();
+  }
+
+  void _startPeriodicSync() {
+    _periodicSyncTimer?.cancel();
+    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      _syncFromCloudSilently();
+    });
+  }
+
+  Future<void> _syncFromCloudSilently() async {
+    try {
+      final response = await Supabase.instance.client
+          .from('notes')
+          .select()
+          .eq('vault_id', widget.vaultId)
+          .order('updated_at', ascending: false);
+
+      final cloudNotes =
+          (response as List).map((e) => Note.fromMap(e)).toList();
+
+      if (!mounted) return;
+
+      bool hasChanges = false;
+      if (cloudNotes.length != _notes.length) {
+        hasChanges = true;
+      } else {
+        for (int i = 0; i < cloudNotes.length; i++) {
+          if (cloudNotes[i].id != _notes[i].id ||
+              cloudNotes[i].updatedAt != _notes[i].updatedAt) {
+            hasChanges = true;
+            break;
+          }
+        }
+      }
+
+      if (hasChanges) {
+        final updatedList = <Note>[];
+        for (final cn in cloudNotes) {
+          if (cn.id == _selectedNote?.id) {
+            final local = _notes.where((n) => n.id == cn.id);
+            updatedList.add(local.isNotEmpty ? local.first : cn);
+          } else {
+            updatedList.add(cn);
+          }
+        }
+        _notes = updatedList;
+        _notesNotifier.value = List.of(_notes);
+      }
+    } catch (_) {}
   }
 
   @override
@@ -64,11 +115,13 @@ class _NotesScreenState extends State<NotesScreen> {
       _selectedNote = null;
       _fetchNotes();
       _setupRealtime();
+      _startPeriodicSync();
     }
   }
 
   @override
   void dispose() {
+    _periodicSyncTimer?.cancel();
     WebPasteListener.setNewNoteHandler(null);
     _searchController.dispose();
     _searchFocusNode.dispose();
@@ -115,58 +168,20 @@ class _NotesScreenState extends State<NotesScreen> {
           event: PostgresChangeEvent.all,
           schema: 'public',
           table: 'notes',
-          filter: PostgresChangeFilter(
-            type: PostgresChangeFilterType.eq,
-            column: 'vault_id',
-            value: widget.vaultId,
-          ),
-          callback: (payload) {
-            _handleRemoteChange(payload);
+          callback: (_) {
+            _syncFromCloudSilently();
+          },
+        )
+        .onBroadcast(
+          event: 'sync',
+          callback: (_) {
+            _syncFromCloudSilently();
           },
         )
         .subscribe();
   }
 
-  void _handleRemoteChange(PostgresChangePayload payload) {
-    if (!mounted) return;
 
-    if (payload.eventType == PostgresChangeEvent.insert) {
-      final newRecord = payload.newRecord;
-      final newNote = Note.fromMap(newRecord);
-      final exists = _notes.any((n) => n.id == newNote.id);
-      if (!exists) {
-        _notes.insert(0, newNote);
-        _notesNotifier.value = List.of(_notes);
-      }
-    } else if (payload.eventType == PostgresChangeEvent.update) {
-      final updatedRecord = payload.newRecord;
-      final updatedNote = Note.fromMap(updatedRecord);
-
-      // Если это открытая заметка, не перезаписываем её — пользователь сейчас печатает
-      if (_selectedNote?.id == updatedNote.id) {
-        return;
-      }
-
-      final index = _notes.indexWhere((n) => n.id == updatedNote.id);
-      if (index != -1) {
-        _notes[index] = updatedNote;
-        _notes.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
-        _notesNotifier.value = List.of(_notes);
-      }
-    } else if (payload.eventType == PostgresChangeEvent.delete) {
-      final oldRecord = payload.oldRecord;
-      final deletedId = oldRecord['id'] as String?;
-      if (deletedId != null) {
-        _notes.removeWhere((n) => n.id == deletedId);
-        _notesNotifier.value = List.of(_notes);
-        if (_selectedNote?.id == deletedId) {
-          setState(() {
-            _selectedNote = _notes.isNotEmpty ? _notes.first : null;
-          });
-        }
-      }
-    }
-  }
 
   void _onNoteLocallyUpdated(
       String noteId, String newTitle, String newPlainText, String newContent) {
@@ -426,16 +441,38 @@ class _NotesScreenState extends State<NotesScreen> {
             },
           ),
           const Spacer(),
-          IconButton(
-            icon: const Icon(Icons.devices_outlined, size: 20),
-            tooltip: 'Синхронизация устройств (QR)',
-            style: IconButton.styleFrom(
-              padding: const EdgeInsets.all(8),
-              minimumSize: const Size(34, 34),
+          InkWell(
+            onTap: _openSyncDialog,
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+              decoration: BoxDecoration(
+                color: accentColor.withAlpha(isDark ? 35 : 20),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: accentColor.withAlpha(isDark ? 90 : 60),
+                  width: 1,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.cloud_done_rounded, size: 14, color: accentColor),
+                  const SizedBox(width: 5),
+                  Text(
+                    widget.vaultId,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.8,
+                      color: isDark ? Colors.white : accentColor,
+                    ),
+                  ),
+                ],
+              ),
             ),
-            onPressed: _openSyncDialog,
           ),
-          const SizedBox(width: 4),
+          const SizedBox(width: 6),
           FilledButton.icon(
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
