@@ -766,7 +766,182 @@ class AppImageEmbedBuilder extends EmbedBuilder {
 
   @override
   Widget build(BuildContext context, EmbedContext embedContext) {
-    final imageSource = embedContext.node.value.data.toString();
+    return _AppImageItemWidget(embedContext: embedContext);
+  }
+}
+
+class _AppImageItemWidget extends StatefulWidget {
+  final EmbedContext embedContext;
+
+  const _AppImageItemWidget({required this.embedContext});
+
+  @override
+  State<_AppImageItemWidget> createState() => _AppImageItemWidgetState();
+}
+
+class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
+  bool _isHovered = false;
+
+  void _deleteImage() {
+    final offset = widget.embedContext.node.documentOffset;
+    final length = widget.embedContext.node.length;
+    widget.embedContext.controller.replaceText(
+      offset,
+      length,
+      '',
+      null,
+    );
+    widget.embedContext.controller.updateSelection(
+      TextSelection.collapsed(offset: offset),
+      ChangeSource.local,
+    );
+  }
+
+  void _showLightbox(Widget imageWidget) {
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.all(24),
+        child: Stack(
+          alignment: Alignment.topRight,
+          children: [
+            Center(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: InteractiveViewer(
+                  child: imageWidget,
+                ),
+              ),
+            ),
+            Positioned(
+              top: 12,
+              right: 12,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Colors.red.withAlpha(200),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: IconButton(
+                      icon: const Icon(Icons.delete_outline,
+                          color: Colors.white, size: 22),
+                      tooltip: 'Удалить изображение',
+                      onPressed: () {
+                        Navigator.of(dialogCtx).pop();
+                        _deleteImage();
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Colors.black.withAlpha(160),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: IconButton(
+                      icon: const Icon(Icons.close,
+                          color: Colors.white, size: 24),
+                      tooltip: 'Закрыть',
+                      onPressed: () => Navigator.of(dialogCtx).pop(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showContextMenu(
+      TapDownDetails details, String imageSource, Widget imageWidget) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+
+    final position = details.globalPosition;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        overlay.size.width - position.dx,
+        overlay.size.height - position.dy,
+      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      color: isDark ? const Color(0xFF222228) : Colors.white,
+      items: [
+        const PopupMenuItem<String>(
+          value: 'view',
+          height: 38,
+          child: Row(
+            children: [
+              Icon(Icons.fullscreen_rounded, size: 18),
+              SizedBox(width: 10),
+              Text('Открыть на весь экран', style: TextStyle(fontSize: 13)),
+            ],
+          ),
+        ),
+        const PopupMenuItem<String>(
+          value: 'copy',
+          height: 38,
+          child: Row(
+            children: [
+              Icon(Icons.copy_rounded, size: 18),
+              SizedBox(width: 10),
+              Text('Скопировать ссылку', style: TextStyle(fontSize: 13)),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(height: 1),
+        PopupMenuItem<String>(
+          value: 'delete',
+          height: 38,
+          child: Row(
+            children: [
+              Icon(Icons.delete_outline_rounded,
+                  size: 18, color: Colors.red.shade400),
+              const SizedBox(width: 10),
+              Text(
+                'Удалить изображение',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: Colors.red.shade400,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+
+    if (!mounted) return;
+
+    if (selected == 'delete') {
+      _deleteImage();
+    } else if (selected == 'copy') {
+      Clipboard.setData(ClipboardData(text: imageSource));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Ссылка скопирована в буфер обмена'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    } else if (selected == 'view') {
+      _showLightbox(imageWidget);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final imageSource = widget.embedContext.node.value.data.toString();
 
     Widget imageWidget;
     if (imageSource.startsWith('data:image/') ||
@@ -833,34 +1008,13 @@ class AppImageEmbedBuilder extends EmbedBuilder {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8.0),
       child: GestureDetector(
-        onTap: () {
-          showDialog(
-            context: context,
-            builder: (_) => Dialog(
-              backgroundColor: Colors.transparent,
-              insetPadding: const EdgeInsets.all(24),
-              child: Stack(
-                alignment: Alignment.topRight,
-                children: [
-                  Center(
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: InteractiveViewer(
-                        child: imageWidget,
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.close, color: Colors.white, size: 28),
-                    onPressed: () => Navigator.of(context).pop(),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
+        onTap: () => _showLightbox(imageWidget),
+        onSecondaryTapDown: (details) =>
+            _showContextMenu(details, imageSource, imageWidget),
         child: MouseRegion(
           cursor: SystemMouseCursors.click,
+          onEnter: (_) => setState(() => _isHovered = true),
+          onExit: (_) => setState(() => _isHovered = false),
           child: ConstrainedBox(
             constraints: const BoxConstraints(
               maxWidth: 550,
@@ -877,9 +1031,38 @@ class AppImageEmbedBuilder extends EmbedBuilder {
                     ? Colors.white.withAlpha(12)
                     : Colors.black.withAlpha(8),
               ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(8.5),
-                child: imageWidget,
+              child: Stack(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8.5),
+                    child: imageWidget,
+                  ),
+                  if (_isHovered)
+                    Positioned(
+                      top: 8,
+                      right: 8,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.black.withAlpha(180),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: IconButton(
+                          icon: const Icon(
+                            Icons.delete_outline_rounded,
+                            size: 19,
+                            color: Colors.white,
+                          ),
+                          tooltip: 'Удалить изображение (ПКМ)',
+                          constraints: const BoxConstraints(
+                            minWidth: 32,
+                            minHeight: 32,
+                          ),
+                          padding: const EdgeInsets.all(6),
+                          onPressed: _deleteImage,
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
           ),

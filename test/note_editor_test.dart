@@ -7,7 +7,8 @@ import 'package:my_notes/note_model.dart';
 import 'package:my_notes/notes_screen.dart';
 
 void main() {
-  testWidgets('NoteEditorView renders text note cleanly', (WidgetTester tester) async {
+  testWidgets('NoteEditorView renders text note cleanly',
+      (WidgetTester tester) async {
     final note = Note(
       id: '82878f91-884f-421a-a026-c3af0c6542ef',
       vaultId: 'TEST-123',
@@ -45,7 +46,8 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('NoteEditorView renders image embed cleanly', (WidgetTester tester) async {
+  testWidgets('NoteEditorView renders image embed cleanly',
+      (WidgetTester tester) async {
     final note = Note(
       id: 'test-img-note',
       vaultId: 'TEST-123',
@@ -55,7 +57,8 @@ void main() {
         {'insert': 'Hello\n'},
         {
           'insert': {
-            'image': 'https://fvkbsnzvluhnxsbzeivy.supabase.co/storage/v1/object/public/note-images/V3X-EGF/1795201737549.png'
+            'image':
+                'https://fvkbsnzvluhnxsbzeivy.supabase.co/storage/v1/object/public/note-images/V3X-EGF/1795201737549.png'
           }
         },
         {'insert': '\n'}
