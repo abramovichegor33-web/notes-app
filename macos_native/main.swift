@@ -4,8 +4,8 @@ import Network
 
 final class StaticFileServer {
     private let listener: NWListener
-    let port: UInt16
     private let rootDir: URL
+    let port: UInt16
 
     init(rootDir: URL) throws {
         self.rootDir = rootDir
@@ -40,24 +40,23 @@ final class StaticFileServer {
             }
 
             let parts = firstLine.components(separatedBy: " ")
-            guard parts.count >= 2 else {
+            guard parts.count >= 2, parts[0] == "GET" else {
                 connection.cancel()
                 return
             }
 
             var path = parts[1]
-            if let qIndex = path.firstIndex(of: "?") {
-                path = String(path[..<qIndex])
-            }
             if path == "/" || path.isEmpty {
                 path = "/index.html"
             }
+            if let queryIndex = path.firstIndex(of: "?") {
+                path = String(path[..<queryIndex])
+            }
 
-            let cleanPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
-            let fileUrl = self.rootDir.appendingPathComponent(cleanPath)
-
-            if let fileData = try? Data(contentsOf: fileUrl) {
-                let mime = self.mimeType(for: fileUrl.pathExtension)
+            let filePath = self.rootDir.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path)
+            if FileManager.default.fileExists(atPath: filePath.path),
+               let fileData = try? Data(contentsOf: filePath) {
+                let mime = self.mimeType(for: filePath.pathExtension)
                 var headers = "HTTP/1.1 200 OK\r\n"
                 headers += "Content-Type: \(mime)\r\n"
                 headers += "Content-Length: \(fileData.count)\r\n"
@@ -70,14 +69,14 @@ final class StaticFileServer {
                 var responseData = headers.data(using: .utf8)!
                 responseData.append(fileData)
 
-                connection.send(content: responseData, completion: .contentProcessed { _ in
+                connection.send(content: responseData, completion: .contentProcessed({ _ in
                     connection.cancel()
-                })
+                }))
             } else {
-                let notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found"
-                connection.send(content: notFound.data(using: .utf8), completion: .contentProcessed { _ in
+                let notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                connection.send(content: notFound.data(using: .utf8)!, completion: .contentProcessed({ _ in
                     connection.cancel()
-                })
+                }))
             }
         }
     }
@@ -85,17 +84,23 @@ final class StaticFileServer {
     private func mimeType(for ext: String) -> String {
         switch ext.lowercased() {
         case "html", "htm": return "text/html; charset=utf-8"
-        case "js": return "application/javascript"
+        case "js": return "application/javascript; charset=utf-8"
+        case "css": return "text/css; charset=utf-8"
         case "json": return "application/json"
-        case "css": return "text/css"
         case "png": return "image/png"
         case "jpg", "jpeg": return "image/jpeg"
         case "svg": return "image/svg+xml"
         case "wasm": return "application/wasm"
         case "ttf": return "font/ttf"
         case "otf": return "font/otf"
+        case "woff": return "font/woff"
+        case "woff2": return "font/woff2"
         default: return "application/octet-stream"
         }
+    }
+
+    func stop() {
+        listener.cancel()
     }
 }
 
@@ -117,7 +122,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let port = server?.port ?? 52831
-        let windowRect = NSRect(x: 100, y: 100, width: 1100, height: 750)
+        let windowRect = NSRect(x: 100, y: 100, width: 1120, height: 760)
         window = NSWindow(
             contentRect: windowRect,
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -125,7 +130,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
         window.title = "Заметки"
-        window.minSize = NSSize(width: 500, height: 400)
+        window.minSize = NSSize(width: 600, height: 450)
         window.center()
 
         let config = WKWebViewConfiguration()
@@ -167,19 +172,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        NSApp.sendAction(Selector(("paste:")), to: nil, from: sender)
+        NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: sender)
+    }
+
+    @objc func newNoteAction(_ sender: Any?) {
+        let js = "window.dispatchEvent(new CustomEvent('flutter_new_note'));"
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     private func setupMainMenu() {
         let mainMenu = NSMenu()
+
+        // Меню приложения
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
         appMenuItem.submenu = appMenu
         appMenu.addItem(withTitle: "О программе Заметки", action: nil, keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Скрыть Заметки", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Скрыть остальные", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Завершить Заметки", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
+        // Меню Файл
+        let fileMenuItem = NSMenuItem()
+        mainMenu.addItem(fileMenuItem)
+        let fileMenu = NSMenu(title: "Файл")
+        fileMenuItem.submenu = fileMenu
+        let newNoteItem = fileMenu.addItem(withTitle: "Новая заметка", action: #selector(newNoteAction(_:)), keyEquivalent: "n")
+        newNoteItem.target = self
+        fileMenu.addItem(NSMenuItem.separator())
+        fileMenu.addItem(withTitle: "Закрыть окно", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+
+        // Меню Правка
         let editMenuItem = NSMenuItem()
         mainMenu.addItem(editMenuItem)
         let editMenu = NSMenu(title: "Правка")

@@ -1,13 +1,27 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
 import 'note_model.dart';
 import 'sync_dialog.dart';
+import 'vault_service.dart';
 import 'web_paste.dart';
+
+String _generateUuid() {
+  final random = Random();
+  final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant
+  final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+}
 
 class NotesScreen extends StatefulWidget {
   final String vaultId;
@@ -25,88 +39,234 @@ class NotesScreen extends StatefulWidget {
 
 class _NotesScreenState extends State<NotesScreen> {
   final _searchController = TextEditingController();
+  final _searchFocusNode = FocusNode();
+
+  List<Note> _notes = [];
+  bool _isLoading = true;
   String _searchQuery = '';
   Note? _selectedNote;
-  late Stream<List<Map<String, dynamic>>> _notesStream;
+  RealtimeChannel? _realtimeChannel;
 
   @override
   void initState() {
     super.initState();
-    _initStream();
-  }
-
-  void _initStream() {
-    _notesStream = Supabase.instance.client
-        .from('notes')
-        .stream(primaryKey: ['id'])
-        .eq('vault_id', widget.vaultId)
-        .order('updated_at', ascending: false);
+    WebPasteListener.setNewNoteHandler(_createNewNote);
+    _fetchNotes();
+    _setupRealtime();
   }
 
   @override
   void didUpdateWidget(covariant NotesScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.vaultId != widget.vaultId) {
-      _initStream();
+      _selectedNote = null;
+      _fetchNotes();
+      _setupRealtime();
     }
   }
 
   @override
   void dispose() {
+    WebPasteListener.setNewNoteHandler(null);
     _searchController.dispose();
+    _searchFocusNode.dispose();
+    _realtimeChannel?.unsubscribe();
     super.dispose();
   }
 
-  Future<void> _createNewNote() async {
+  Future<void> _fetchNotes() async {
+    setState(() => _isLoading = true);
     try {
-      final newNoteData = {
-        'vault_id': widget.vaultId,
-        'title': 'Новая заметка',
-        'content': '',
-        'plain_text': '',
-      };
-
       final response = await Supabase.instance.client
           .from('notes')
-          .insert(newNoteData)
           .select()
-          .single();
+          .eq('vault_id', widget.vaultId)
+          .order('updated_at', ascending: false);
 
-      final createdNote = Note.fromMap(response);
-      setState(() {
-        _selectedNote = createdNote;
-      });
+      final fetched = (response as List).map((e) => Note.fromMap(e)).toList();
 
-      if (mounted && MediaQuery.of(context).size.width < 700) {
-        Navigator.of(context).push(
-          MaterialPageRoute(
-            builder: (_) => NoteEditorPage(
-              note: createdNote,
-              vaultId: widget.vaultId,
-            ),
-          ),
-        );
-      }
-    } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Ошибка создания заметки: $e'),
-            backgroundColor: Colors.red,
+        setState(() {
+          _notes = fetched;
+          _isLoading = false;
+          if (_selectedNote != null) {
+            final match = _notes.where((n) => n.id == _selectedNote!.id);
+            _selectedNote = match.isNotEmpty ? match.first : null;
+          }
+          if (_selectedNote == null && _notes.isNotEmpty) {
+            _selectedNote = _notes.first;
+          }
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  void _setupRealtime() {
+    _realtimeChannel?.unsubscribe();
+    _realtimeChannel = Supabase.instance.client
+        .channel('notes_vault_${widget.vaultId}')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'notes',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'vault_id',
+            value: widget.vaultId,
           ),
-        );
+          callback: (payload) {
+            _handleRemoteChange(payload);
+          },
+        )
+        .subscribe();
+  }
+
+  void _handleRemoteChange(PostgresChangePayload payload) {
+    if (!mounted) return;
+
+    if (payload.eventType == PostgresChangeEvent.insert) {
+      final newRecord = payload.newRecord;
+      final newNote = Note.fromMap(newRecord);
+      final exists = _notes.any((n) => n.id == newNote.id);
+      if (!exists) {
+        setState(() {
+          _notes.insert(0, newNote);
+        });
+      }
+    } else if (payload.eventType == PostgresChangeEvent.update) {
+      final updatedRecord = payload.newRecord;
+      final updatedNote = Note.fromMap(updatedRecord);
+
+      final index = _notes.indexWhere((n) => n.id == updatedNote.id);
+      if (index != -1) {
+        // Если это текущая открытая заметка, обновляем только метаданные,
+        // чтобы не сбивать активный ввод текста
+        final isCurrentSelected = _selectedNote?.id == updatedNote.id;
+        if (!isCurrentSelected) {
+          setState(() {
+            _notes[index] = updatedNote;
+            _notes.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+          });
+        }
+      }
+    } else if (payload.eventType == PostgresChangeEvent.delete) {
+      final oldRecord = payload.oldRecord;
+      final deletedId = oldRecord['id'] as String?;
+      if (deletedId != null) {
+        setState(() {
+          _notes.removeWhere((n) => n.id == deletedId);
+          if (_selectedNote?.id == deletedId) {
+            _selectedNote = _notes.isNotEmpty ? _notes.first : null;
+          }
+        });
       }
     }
   }
 
+  void _onNoteLocallyUpdated(
+      String noteId, String newTitle, String newPlainText, String newContent) {
+    final index = _notes.indexWhere((n) => n.id == noteId);
+    if (index != -1) {
+      final updated = _notes[index].copyWith(
+        title: newTitle,
+        plainText: newPlainText,
+        content: newContent,
+        updatedAt: DateTime.now(),
+      );
+      setState(() {
+        _notes.removeAt(index);
+        _notes.insert(0, updated);
+        if (_selectedNote?.id == noteId) {
+          _selectedNote = updated;
+        }
+      });
+    }
+  }
+
+  Future<void> _createNewNote() async {
+    final newNote = Note(
+      id: _generateUuid(),
+      vaultId: widget.vaultId,
+      title: 'Новая заметка',
+      content: jsonEncode([
+        {'insert': '\n'}
+      ]),
+      plainText: '',
+      updatedAt: DateTime.now(),
+    );
+
+    setState(() {
+      _notes.insert(0, newNote);
+      _selectedNote = newNote;
+    });
+
+    try {
+      await Supabase.instance.client.from('notes').insert(newNote.toMap());
+    } catch (_) {}
+
+    if (mounted && MediaQuery.of(context).size.width < 720) {
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => NoteEditorPage(
+            note: newNote,
+            vaultId: widget.vaultId,
+            onNoteUpdated: _onNoteLocallyUpdated,
+            onNoteDeleted: _deleteNote,
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> _confirmDeleteNote(Note note) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        final isDark = Theme.of(ctx).brightness == Brightness.dark;
+        return AlertDialog(
+          backgroundColor: isDark ? const Color(0xFF1E1E24) : Colors.white,
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          title: const Text('Удалить заметку?', style: TextStyle(fontSize: 18)),
+          content: Text(
+            'Заметка «${note.title.isEmpty ? "Без названия" : note.title}» будет удалена навсегда.',
+            style: const TextStyle(fontSize: 14),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.red.shade600,
+                foregroundColor: Colors.white,
+              ),
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Удалить'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed == true) {
+      await _deleteNote(note.id);
+    }
+  }
+
   Future<void> _deleteNote(String noteId) async {
+    setState(() {
+      _notes.removeWhere((n) => n.id == noteId);
+      if (_selectedNote?.id == noteId) {
+        _selectedNote = _notes.isNotEmpty ? _notes.first : null;
+      }
+    });
+
     try {
       await Supabase.instance.client.from('notes').delete().eq('id', noteId);
-      if (_selectedNote?.id == noteId) {
-        setState(() {
-          _selectedNote = null;
-        });
-      }
     } catch (_) {}
   }
 
@@ -127,160 +287,439 @@ class _NotesScreenState extends State<NotesScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isDesktop = MediaQuery.of(context).size.width >= 700;
+    final isDesktop = MediaQuery.of(context).size.width >= 720;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Заметки'),
-        actions: [
+    final filteredNotes = _notes.where((n) {
+      if (_searchQuery.isEmpty) return true;
+      return n.title.toLowerCase().contains(_searchQuery) ||
+          n.plainText.toLowerCase().contains(_searchQuery);
+    }).toList();
+
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.keyN, meta: true):
+            _createNewNote,
+        const SingleActivator(LogicalKeyboardKey.keyN, control: true):
+            _createNewNote,
+        const SingleActivator(LogicalKeyboardKey.keyF, meta: true): () {
+          _searchFocusNode.requestFocus();
+        },
+        const SingleActivator(LogicalKeyboardKey.keyF, control: true): () {
+          _searchFocusNode.requestFocus();
+        },
+      },
+      child: Focus(
+        autofocus: true,
+        child: Scaffold(
+          backgroundColor:
+              isDark ? const Color(0xFF141416) : const Color(0xFFFFFFFF),
+          body: Row(
+            children: [
+              // Боковая панель заметок (Sidebar)
+              Container(
+                width: isDesktop ? 330 : MediaQuery.of(context).size.width,
+                decoration: BoxDecoration(
+                  color: isDark
+                      ? const Color(0xFF1A1A1E)
+                      : const Color(0xFFF8FAFC),
+                  border: isDesktop
+                      ? Border(
+                          right: BorderSide(
+                            color: isDark
+                                ? const Color(0xFF27272E)
+                                : const Color(0xFFE2E8F0),
+                            width: 1,
+                          ),
+                        )
+                      : null,
+                ),
+                child: Column(
+                  children: [
+                    _buildSidebarHeader(isDark),
+                    _buildSearchBar(isDark),
+                    Expanded(
+                      child: _buildNotesListView(filteredNotes, isDark, isDesktop),
+                    ),
+                  ],
+                ),
+              ),
+
+              // Правая область редактора заметки (Desktop)
+              if (isDesktop)
+                Expanded(
+                  child: _selectedNote == null
+                      ? _buildEmptyState(isDark)
+                      : NoteEditorView(
+                          key: ValueKey(_selectedNote!.id),
+                          note: _selectedNote!,
+                          vaultId: widget.vaultId,
+                          onNoteUpdated: _onNoteLocallyUpdated,
+                          onDeleteRequested: () =>
+                              _confirmDeleteNote(_selectedNote!),
+                        ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSidebarHeader(bool isDark) {
+    final accentColor = Theme.of(context).colorScheme.primary;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(7),
+            decoration: BoxDecoration(
+              color: accentColor.withAlpha(isDark ? 40 : 25),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Icon(Icons.edit_note_rounded, color: accentColor, size: 22),
+          ),
+          const SizedBox(width: 10),
+          const Text(
+            'Заметки',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              letterSpacing: -0.3,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+            decoration: BoxDecoration(
+              color: isDark
+                  ? Colors.white.withAlpha(16)
+                  : Colors.black.withAlpha(10),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              '${_notes.length}',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: isDark ? Colors.white70 : Colors.black54,
+              ),
+            ),
+          ),
+          const Spacer(),
           IconButton(
-            icon: const Icon(Icons.devices_outlined),
-            tooltip: 'Связать устройства (QR / Код)',
+            icon: const Icon(Icons.devices_outlined, size: 20),
+            tooltip: 'Синхронизация устройств (QR)',
+            style: IconButton.styleFrom(
+              padding: const EdgeInsets.all(8),
+              minimumSize: const Size(34, 34),
+            ),
             onPressed: _openSyncDialog,
           ),
-          IconButton(
-            icon: const Icon(Icons.add),
-            tooltip: 'Создать заметку',
+          const SizedBox(width: 4),
+          FilledButton.icon(
+            style: FilledButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              minimumSize: const Size(36, 36),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            icon: const Icon(Icons.add, size: 18),
+            label: const Text('Новая',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
             onPressed: _createNewNote,
           ),
-        ],
-      ),
-      body: Row(
-        children: [
-          SizedBox(
-            width: isDesktop ? 320 : MediaQuery.of(context).size.width,
-            child: _buildNotesList(isDesktop),
-          ),
-          if (isDesktop) ...[
-            const VerticalDivider(width: 1),
-            Expanded(
-              child: _selectedNote == null
-                  ? const Center(
-                      child: Text(
-                        'Выберите заметку или создайте новую',
-                        style: TextStyle(color: Colors.grey, fontSize: 16),
-                      ),
-                    )
-                  : NoteEditorView(
-                      key: ValueKey(_selectedNote!.id),
-                      note: _selectedNote!,
-                      vaultId: widget.vaultId,
-                    ),
-            ),
-          ],
         ],
       ),
     );
   }
 
-  Widget _buildNotesList(bool isDesktop) {
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(12),
-          child: TextField(
-            controller: _searchController,
-            decoration: InputDecoration(
-              hintText: 'Поиск заметок...',
-              prefixIcon: const Icon(Icons.search, size: 20),
-              suffixIcon: _searchQuery.isNotEmpty
-                  ? IconButton(
-                      icon: const Icon(Icons.clear, size: 18),
-                      onPressed: () {
-                        _searchController.clear();
-                        setState(() => _searchQuery = '');
-                      },
-                    )
-                  : null,
-              filled: true,
-              isDense: true,
-              contentPadding: const EdgeInsets.symmetric(vertical: 10),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(10),
-                borderSide: BorderSide.none,
-              ),
-            ),
-            onChanged: (val) =>
-                setState(() => _searchQuery = val.trim().toLowerCase()),
+  Widget _buildSearchBar(bool isDark) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: TextField(
+        controller: _searchController,
+        focusNode: _searchFocusNode,
+        decoration: InputDecoration(
+          hintText: 'Поиск заметок... (⌘F)',
+          hintStyle: TextStyle(
+            fontSize: 13,
+            color: isDark ? Colors.white38 : Colors.black38,
+          ),
+          prefixIcon: Icon(
+            Icons.search,
+            size: 18,
+            color: isDark ? Colors.white54 : Colors.black45,
+          ),
+          suffixIcon: _searchQuery.isNotEmpty
+              ? IconButton(
+                  icon: const Icon(Icons.clear, size: 16),
+                  onPressed: () {
+                    _searchController.clear();
+                    setState(() => _searchQuery = '');
+                  },
+                )
+              : null,
+          filled: true,
+          fillColor: isDark
+              ? const Color(0xFF23232A)
+              : const Color(0xFFEDF2F7),
+          isDense: true,
+          contentPadding:
+              const EdgeInsets.symmetric(vertical: 9, horizontal: 10),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(10),
+            borderSide: BorderSide.none,
           ),
         ),
-        Expanded(
-          child: StreamBuilder<List<Map<String, dynamic>>>(
-            stream: _notesStream,
-            builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.waiting) {
-                return const Center(child: CircularProgressIndicator());
-              }
+        onChanged: (val) =>
+            setState(() => _searchQuery = val.trim().toLowerCase()),
+      ),
+    );
+  }
 
-              final data = snapshot.data ?? [];
-              final allNotes = data.map((e) => Note.fromMap(e)).toList();
+  Widget _buildNotesListView(
+      List<Note> notes, bool isDark, bool isDesktop) {
+    if (_isLoading && _notes.isEmpty) {
+      return const Center(
+        child: SizedBox(
+          width: 24,
+          height: 24,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
 
-              final filteredNotes = allNotes.where((n) {
-                if (_searchQuery.isEmpty) return true;
-                return n.title.toLowerCase().contains(_searchQuery) ||
-                    n.plainText.toLowerCase().contains(_searchQuery);
-              }).toList();
+    if (notes.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _searchQuery.isEmpty
+                    ? Icons.note_alt_outlined
+                    : Icons.search_off_rounded,
+                size: 38,
+                color: isDark ? Colors.white24 : Colors.black26,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                _searchQuery.isEmpty
+                    ? 'Заметок пока нет\nНажмите «Новая», чтобы начать'
+                    : 'Ничего не найдено',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 13,
+                  color: isDark ? Colors.white38 : Colors.black45,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
 
-              if (filteredNotes.isEmpty) {
-                return Center(
-                  child: Text(
-                    _searchQuery.isEmpty
-                        ? 'Заметок пока нет'
-                        : 'Ничего не найдено',
-                    style: const TextStyle(color: Colors.grey),
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      itemCount: notes.length,
+      itemBuilder: (context, index) {
+        final note = notes[index];
+        final isSelected = isDesktop && _selectedNote?.id == note.id;
+
+        return _NoteCardItem(
+          note: note,
+          isSelected: isSelected,
+          isDark: isDark,
+          onTap: () {
+            setState(() => _selectedNote = note);
+            if (!isDesktop) {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => NoteEditorPage(
+                    note: note,
+                    vaultId: widget.vaultId,
+                    onNoteUpdated: _onNoteLocallyUpdated,
+                    onNoteDeleted: _deleteNote,
                   ),
-                );
-              }
+                ),
+              );
+            }
+          },
+          onDelete: () => _confirmDeleteNote(note),
+        );
+      },
+    );
+  }
 
-              return ListView.separated(
-                itemCount: filteredNotes.length,
-                separatorBuilder: (_, _) => const Divider(height: 1),
-                itemBuilder: (context, index) {
-                  final note = filteredNotes[index];
-                  final isSelected = isDesktop && _selectedNote?.id == note.id;
+  Widget _buildEmptyState(bool isDark) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.article_outlined,
+            size: 52,
+            color: isDark ? Colors.white12 : Colors.black12,
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Выберите заметку из списка',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w500,
+              color: isDark ? Colors.white54 : Colors.black54,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Или нажмите «Новая заметка» (⌘N)',
+            style: TextStyle(
+              fontSize: 13,
+              color: isDark ? Colors.white24 : Colors.black26,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
-                  return ListTile(
-                    selected: isSelected,
-                    selectedTileColor: Theme.of(context)
-                        .colorScheme
-                        .primaryContainer
-                        .withAlpha(80),
-                    title: Text(
-                      note.title.isEmpty ? 'Без названия' : note.title,
+class _NoteCardItem extends StatefulWidget {
+  final Note note;
+  final bool isSelected;
+  final bool isDark;
+  final VoidCallback onTap;
+  final VoidCallback onDelete;
+
+  const _NoteCardItem({
+    required this.note,
+    required this.isSelected,
+    required this.isDark,
+    required this.onTap,
+    required this.onDelete,
+  });
+
+  @override
+  State<_NoteCardItem> createState() => _NoteCardItemState();
+}
+
+class _NoteCardItemState extends State<_NoteCardItem> {
+  bool _isHovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final accent = theme.colorScheme.primary;
+
+    Color bgColor;
+    if (widget.isSelected) {
+      bgColor = widget.isDark
+          ? const Color(0xFF282832)
+          : const Color(0xFFEEF2FF);
+    } else if (_isHovered) {
+      bgColor = widget.isDark
+          ? const Color(0xFF202028)
+          : const Color(0xFFF1F5F9);
+    } else {
+      bgColor = Colors.transparent;
+    }
+
+    final title = widget.note.title.trim().isEmpty
+        ? 'Без названия'
+        : widget.note.title.trim();
+    final preview = widget.note.plainText.trim().isEmpty
+        ? 'Нет дополнительного текста'
+        : widget.note.plainText.replaceAll('\n', ' ').trim();
+
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 140),
+          margin: const EdgeInsets.symmetric(vertical: 3),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: bgColor,
+            borderRadius: BorderRadius.circular(10),
+            border: widget.isSelected
+                ? Border.all(color: accent.withAlpha(120), width: 1.2)
+                : Border.all(color: Colors.transparent, width: 1.2),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      title,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontWeight: FontWeight.w600),
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: widget.isSelected
+                            ? FontWeight.bold
+                            : FontWeight.w600,
+                        color: widget.isDark
+                            ? Colors.white
+                            : const Color(0xFF0F172A),
+                      ),
                     ),
-                    subtitle: Text(
-                      note.plainText.isEmpty ? 'Пустая заметка' : note.plainText,
-                      maxLines: 2,
+                  ),
+                  if (_isHovered || widget.isSelected)
+                    InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: widget.onDelete,
+                      child: Padding(
+                        padding: const EdgeInsets.all(2),
+                        child: Icon(
+                          Icons.delete_outline,
+                          size: 16,
+                          color: Colors.red.withAlpha(180),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Text(
+                    widget.note.formattedDate,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                      color: widget.isSelected
+                          ? accent
+                          : (widget.isDark ? Colors.white54 : Colors.black45),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      preview,
+                      maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontSize: 12),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: widget.isDark ? Colors.white38 : Colors.black45,
+                      ),
                     ),
-                    trailing: IconButton(
-                      icon: const Icon(Icons.delete_outline, size: 20),
-                      onPressed: () => _deleteNote(note.id),
-                    ),
-                    onTap: () {
-                      setState(() => _selectedNote = note);
-                      if (!isDesktop) {
-                        Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) => NoteEditorPage(
-                              note: note,
-                              vaultId: widget.vaultId,
-                            ),
-                          ),
-                        );
-                      }
-                    },
-                  );
-                },
-              );
-            },
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
-      ],
+      ),
     );
   }
 }
@@ -288,11 +727,15 @@ class _NotesScreenState extends State<NotesScreen> {
 class NoteEditorPage extends StatelessWidget {
   final Note note;
   final String vaultId;
+  final Function(String, String, String, String) onNoteUpdated;
+  final Function(String) onNoteDeleted;
 
   const NoteEditorPage({
     super.key,
     required this.note,
     required this.vaultId,
+    required this.onNoteUpdated,
+    required this.onNoteDeleted,
   });
 
   @override
@@ -300,15 +743,17 @@ class NoteEditorPage extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(
         title: Text(note.title.isEmpty ? 'Заметка' : note.title),
+        elevation: 0,
       ),
       body: NoteEditorView(
         note: note,
         vaultId: vaultId,
+        onNoteUpdated: onNoteUpdated,
+        onDeleteRequested: () => onNoteDeleted(note.id),
       ),
     );
   }
 }
-
 
 class AppImageEmbedBuilder extends EmbedBuilder {
   const AppImageEmbedBuilder();
@@ -324,13 +769,18 @@ class AppImageEmbedBuilder extends EmbedBuilder {
     final imageSource = embedContext.node.value.data.toString();
 
     Widget imageWidget;
-    if (imageSource.startsWith('data:image/') || imageSource.contains('base64')) {
+    if (imageSource.startsWith('data:image/') ||
+        imageSource.contains('base64')) {
       final base64String =
           imageSource.contains(',') ? imageSource.split(',')[1] : imageSource;
-      imageWidget = Image.memory(
-        base64Decode(base64String),
-        fit: BoxFit.contain,
-      );
+      try {
+        imageWidget = Image.memory(
+          base64Decode(base64String),
+          fit: BoxFit.contain,
+        );
+      } catch (_) {
+        imageWidget = const Icon(Icons.broken_image, size: 40);
+      }
     } else {
       imageWidget = Image.network(
         imageSource,
@@ -338,8 +788,8 @@ class AppImageEmbedBuilder extends EmbedBuilder {
         loadingBuilder: (context, child, loadingProgress) {
           if (loadingProgress == null) return child;
           return Container(
-            height: 150,
-            width: 200,
+            height: 160,
+            width: 220,
             color: Colors.black12,
             child: const Center(
               child: SizedBox(
@@ -418,9 +868,9 @@ class AppImageEmbedBuilder extends EmbedBuilder {
             ),
             child: Container(
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(10),
                 border: Border.all(
-                  color: isDark ? Colors.white38 : Colors.black26,
+                  color: isDark ? Colors.white30 : Colors.black26,
                   width: 1.5,
                 ),
                 color: isDark
@@ -428,7 +878,7 @@ class AppImageEmbedBuilder extends EmbedBuilder {
                     : Colors.black.withAlpha(8),
               ),
               child: ClipRRect(
-                borderRadius: BorderRadius.circular(6.5),
+                borderRadius: BorderRadius.circular(8.5),
                 child: imageWidget,
               ),
             ),
@@ -442,11 +892,15 @@ class AppImageEmbedBuilder extends EmbedBuilder {
 class NoteEditorView extends StatefulWidget {
   final Note note;
   final String vaultId;
+  final Function(String, String, String, String)? onNoteUpdated;
+  final VoidCallback? onDeleteRequested;
 
   const NoteEditorView({
     super.key,
     required this.note,
     required this.vaultId,
+    this.onNoteUpdated,
+    this.onDeleteRequested,
   });
 
   @override
@@ -458,9 +912,12 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   late QuillController _quillController;
   StreamSubscription? _docChangeSub;
   Timer? _debounceTimer;
+
   String _lastSavedTitle = '';
   String _lastSavedContent = '';
-  bool _isSaving = false;
+
+  final ValueNotifier<bool> _isSavingNotifier = ValueNotifier(false);
+  final ValueNotifier<bool> _isSavedNotifier = ValueNotifier(true);
 
   @override
   void initState() {
@@ -491,9 +948,9 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     }
 
     _titleController.addListener(_onTitleChanged);
-    _docChangeSub = _quillController.changes.listen((_) => _scheduleSave());
+    _docChangeSub = _quillController.changes.listen((_) => _onContentChanged());
 
-    // Слушатель веб-события вставки изображения (Cmd+V в браузере/WebView)
+    // Слушатель веб-события вставки изображения (Cmd+V в WKWebView)
     WebPasteListener.setHandler((bytes) {
       if (mounted) {
         _insertImageBytes(bytes);
@@ -502,41 +959,41 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   }
 
   void _onTitleChanged() {
-    if (_titleController.text.trim() != _lastSavedTitle) {
-      _scheduleSave();
-    }
+    _notifyLocalChange();
+    _scheduleSave();
   }
 
-  @override
-  void dispose() {
-    WebPasteListener.setHandler(null);
-    _debounceTimer?.cancel();
-    _docChangeSub?.cancel();
-    _saveNote(updateUi: false);
-    _titleController.dispose();
-    _quillController.dispose();
-    super.dispose();
+  void _onContentChanged() {
+    _notifyLocalChange();
+    _scheduleSave();
+  }
+
+  void _notifyLocalChange() {
+    final title = _titleController.text.trim();
+    final plainText = _quillController.document.toPlainText().trim();
+    final content = jsonEncode(_quillController.document.toDelta().toJson());
+
+    widget.onNoteUpdated?.call(widget.note.id, title, plainText, content);
   }
 
   void _scheduleSave() {
+    _isSavedNotifier.value = false;
     _debounceTimer?.cancel();
-    _debounceTimer = Timer(const Duration(milliseconds: 1200), _saveNote);
+    _debounceTimer = Timer(const Duration(milliseconds: 1000), _saveNote);
   }
 
-  Future<void> _saveNote({bool updateUi = true}) async {
+  Future<void> _saveNote() async {
     final title = _titleController.text.trim();
     final content = jsonEncode(_quillController.document.toDelta().toJson());
 
     if (title == _lastSavedTitle && content == _lastSavedContent) {
+      _isSavedNotifier.value = true;
       return;
     }
 
     _lastSavedTitle = title;
     _lastSavedContent = content;
-
-    if (updateUi && mounted) {
-      setState(() => _isSaving = true);
-    }
+    _isSavingNotifier.value = true;
 
     try {
       final plainText = _quillController.document.toPlainText().trim();
@@ -549,12 +1006,24 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         'plain_text': plainText,
         'updated_at': DateTime.now().toIso8601String(),
       });
+      _isSavedNotifier.value = true;
     } catch (_) {
     } finally {
-      if (updateUi && mounted) {
-        setState(() => _isSaving = false);
-      }
+      _isSavingNotifier.value = false;
     }
+  }
+
+  @override
+  void dispose() {
+    WebPasteListener.setHandler(null);
+    _debounceTimer?.cancel();
+    _docChangeSub?.cancel();
+    _saveNote();
+    _titleController.dispose();
+    _quillController.dispose();
+    _isSavingNotifier.dispose();
+    _isSavedNotifier.dispose();
+    super.dispose();
   }
 
   Future<String?> _uploadImageToStorage(Uint8List bytes) async {
@@ -568,31 +1037,20 @@ class _NoteEditorViewState extends State<NoteEditorView> {
             fileOptions: const FileOptions(contentType: 'image/png'),
           );
 
-      final publicUrl = Supabase.instance.client.storage
+      return Supabase.instance.client.storage
           .from('note-images')
           .getPublicUrl(storagePath);
-
-      return publicUrl;
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Не удалось загрузить изображение')),
-        );
-      }
+    } catch (_) {
       return null;
     }
   }
 
   Future<void> _insertImageBytes(Uint8List bytes) async {
-    if (mounted) {
-      setState(() => _isSaving = true);
-    }
-    final url = await _uploadImageToStorage(bytes);
-    if (mounted) {
-      setState(() => _isSaving = false);
-    }
+    _isSavingNotifier.value = true;
+    final cloudUrl = await _uploadImageToStorage(bytes);
+    _isSavingNotifier.value = false;
 
-    if (url != null) {
+    if (cloudUrl != null && mounted) {
       final index = _quillController.selection.baseOffset;
       final length = _quillController.selection.extentOffset - index;
       final safeIndex =
@@ -602,14 +1060,14 @@ class _NoteEditorViewState extends State<NoteEditorView> {
       _quillController.replaceText(
         safeIndex,
         safeLength,
-        BlockEmbed.image(url),
+        BlockEmbed.image(cloudUrl),
         null,
       );
       _quillController.updateSelection(
         TextSelection.collapsed(offset: safeIndex + 1),
         ChangeSource.local,
       );
-      _scheduleSave();
+      _onContentChanged();
     }
   }
 
@@ -622,78 +1080,167 @@ class _NoteEditorViewState extends State<NoteEditorView> {
           await _insertImageBytes(bytes);
         }
       }
-    } catch (e) {
-      debugPrint('Error picking image: $e');
-    }
+    } catch (_) {}
   }
 
   @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
     return Column(
       children: [
+        // Верхняя панель заметки (Заголовок, статус сохранения, действия)
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          padding: const EdgeInsets.fromLTRB(28, 16, 24, 8),
           child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               Expanded(
                 child: TextField(
                   controller: _titleController,
-                  style: const TextStyle(
-                      fontSize: 22, fontWeight: FontWeight.bold),
-                  decoration: const InputDecoration(
+                  style: TextStyle(
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: -0.4,
+                    color: isDark ? Colors.white : const Color(0xFF0F172A),
+                  ),
+                  decoration: InputDecoration(
                     hintText: 'Заголовок заметки',
+                    hintStyle: TextStyle(
+                      color: isDark ? Colors.white24 : Colors.black26,
+                      fontWeight: FontWeight.w600,
+                    ),
                     border: InputBorder.none,
+                    isDense: true,
+                    contentPadding: EdgeInsets.zero,
                   ),
                 ),
               ),
-              if (_isSaving)
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 8.0),
-                  child: SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                ),
+
+              // Индикатор статуса сохранения
+              ValueListenableBuilder<bool>(
+                valueListenable: _isSavingNotifier,
+                builder: (context, isSaving, _) {
+                  if (isSaving) {
+                    return Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const SizedBox(
+                          width: 12,
+                          height: 12,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Сохранение...',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: isDark ? Colors.white38 : Colors.black45,
+                          ),
+                        ),
+                      ],
+                    );
+                  }
+
+                  return ValueListenableBuilder<bool>(
+                    valueListenable: _isSavedNotifier,
+                    builder: (context, isSaved, _) {
+                      return Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            isSaved ? Icons.check_circle_outline : Icons.edit,
+                            size: 14,
+                            color: isSaved
+                                ? Colors.green.withAlpha(200)
+                                : (isDark ? Colors.white38 : Colors.black45),
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            isSaved ? 'Сохранено' : 'Не сохранено',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: isDark ? Colors.white38 : Colors.black45,
+                            ),
+                          ),
+                        ],
+                      );
+                    },
+                  );
+                },
+              ),
+              const SizedBox(width: 16),
+
+              // Кнопка вставки картинки
               IconButton(
-                icon: const Icon(Icons.image_outlined),
-                tooltip: 'Вставить изображение из файла',
+                icon: const Icon(Icons.add_photo_alternate_outlined, size: 21),
+                tooltip: 'Вставить изображение',
                 onPressed: _pickImage,
               ),
+
+              // Кнопка удаления заметки
+              if (widget.onDeleteRequested != null)
+                IconButton(
+                  icon: Icon(
+                    Icons.delete_outline,
+                    size: 21,
+                    color: Colors.red.withAlpha(190),
+                  ),
+                  tooltip: 'Удалить заметку',
+                  onPressed: widget.onDeleteRequested,
+                ),
             ],
           ),
         ),
-        QuillSimpleToolbar(
-          controller: _quillController,
-          config: const QuillSimpleToolbarConfig(
-            showFontFamily: false,
-            showFontSize: false,
-            showColorButton: false,
-            showBackgroundColorButton: false,
-            showSubscript: false,
-            showSuperscript: false,
-            showSearchButton: false,
-            showInlineCode: false,
-            showCodeBlock: false,
-            showAlignmentButtons: false,
-            showDirection: false,
-            showLink: false,
-            showListCheck: true,
-            showListBullets: true,
-            showListNumbers: true,
-            showQuote: true,
-            showIndent: false,
+
+        // Панель форматирования текста (Toolbar)
+        Container(
+          margin: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
+          decoration: BoxDecoration(
+            color: isDark
+                ? const Color(0xFF1E1E24)
+                : const Color(0xFFF1F5F9),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: QuillSimpleToolbar(
+            controller: _quillController,
+            config: const QuillSimpleToolbarConfig(
+              showFontFamily: false,
+              showFontSize: false,
+              showColorButton: false,
+              showBackgroundColorButton: false,
+              showSubscript: false,
+              showSuperscript: false,
+              showSearchButton: false,
+              showInlineCode: true,
+              showCodeBlock: true,
+              showAlignmentButtons: false,
+              showDirection: false,
+              showLink: false,
+              showListCheck: true,
+              showListBullets: true,
+              showListNumbers: true,
+              showQuote: true,
+              showIndent: false,
+              showClearFormat: true,
+              buttonOptions: QuillSimpleToolbarButtonOptions(
+                base: QuillToolbarBaseButtonOptions(
+                  iconSize: 18,
+                ),
+              ),
+            ),
           ),
         ),
-        const Divider(height: 1),
+
+        // Поле текстового редактора
         Expanded(
           child: Padding(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.fromLTRB(28, 12, 28, 16),
             child: QuillEditor.basic(
               controller: _quillController,
               config: const QuillEditorConfig(
                 placeholder:
-                    'Начните писать или вставьте текст / скриншот (Cmd+V)...',
+                    'Начните писать или вставьте текст / скриншот (⌘V)...',
                 embedBuilders: [
                   AppImageEmbedBuilder(),
                 ],
