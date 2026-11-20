@@ -7,6 +7,7 @@ import 'package:flutter_quill/flutter_quill.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'note_model.dart';
 import 'sync_dialog.dart';
+import 'web_paste.dart';
 
 class NotesScreen extends StatefulWidget {
   final String vaultId;
@@ -308,6 +309,49 @@ class NoteEditorPage extends StatelessWidget {
   }
 }
 
+class ImageEmbedBuilder extends EmbedBuilder {
+  const ImageEmbedBuilder();
+
+  @override
+  String get key => BlockEmbed.imageType;
+
+  @override
+  Widget build(BuildContext context, EmbedContext embedContext) {
+    final imageUrl = embedContext.node.value.data as String;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.network(
+          imageUrl,
+          fit: BoxFit.contain,
+          errorBuilder: (context, error, stackTrace) => const Row(
+            children: [
+              Icon(Icons.broken_image, color: Colors.grey),
+              SizedBox(width: 8),
+              Text('Не удалось загрузить изображение',
+                  style: TextStyle(color: Colors.grey)),
+            ],
+          ),
+          loadingBuilder: (_, child, loadingProgress) {
+            if (loadingProgress == null) return child;
+            return const Padding(
+              padding: EdgeInsets.all(16.0),
+              child: Center(
+                child: SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
 class NoteEditorView extends StatefulWidget {
   final Note note;
   final String vaultId;
@@ -340,7 +384,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
     final controllerConfig = QuillControllerConfig(
       clipboardConfig: QuillClipboardConfig(
-        onImagePaste: _onImagePaste,
+        onImagePaste: _uploadImageToStorage,
       ),
     );
 
@@ -361,6 +405,13 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
     _titleController.addListener(_onTitleChanged);
     _docChangeSub = _quillController.changes.listen((_) => _scheduleSave());
+
+    // Слушатель веб-события вставки изображения (Cmd+V в браузере/WebView)
+    WebPasteListener.register((bytes) {
+      if (mounted) {
+        _insertImageBytes(bytes);
+      }
+    });
   }
 
   void _onTitleChanged() {
@@ -418,7 +469,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     }
   }
 
-  Future<String?> _onImagePaste(Uint8List bytes) async {
+  Future<String?> _uploadImageToStorage(Uint8List bytes) async {
     try {
       final fileName = '${DateTime.now().millisecondsSinceEpoch}.png';
       final storagePath = '${widget.vaultId}/$fileName';
@@ -444,32 +495,46 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     }
   }
 
-  Future<void> _pickImage() async {
-    final file = await FilePicker.pickFile(type: FileType.image);
-    if (file != null) {
-      final bytes = await file.readAsBytes();
-      if (bytes.isNotEmpty) {
-        final url = await _onImagePaste(bytes);
-        if (url != null) {
-          final index = _quillController.selection.baseOffset;
-          final length = _quillController.selection.extentOffset - index;
-          final safeIndex =
-              index < 0 ? _quillController.document.length - 1 : index;
-          final safeLength = length < 0 ? 0 : length;
+  Future<void> _insertImageBytes(Uint8List bytes) async {
+    if (mounted) {
+      setState(() => _isSaving = true);
+    }
+    final url = await _uploadImageToStorage(bytes);
+    if (mounted) {
+      setState(() => _isSaving = false);
+    }
 
-          _quillController.replaceText(
-            safeIndex,
-            safeLength,
-            BlockEmbed.image(url),
-            null,
-          );
-          _quillController.updateSelection(
-            TextSelection.collapsed(offset: safeIndex + 1),
-            ChangeSource.local,
-          );
+    if (url != null) {
+      final index = _quillController.selection.baseOffset;
+      final length = _quillController.selection.extentOffset - index;
+      final safeIndex =
+          index < 0 ? _quillController.document.length - 1 : index;
+      final safeLength = length < 0 ? 0 : length;
+
+      _quillController.replaceText(
+        safeIndex,
+        safeLength,
+        BlockEmbed.image(url),
+        null,
+      );
+      _quillController.updateSelection(
+        TextSelection.collapsed(offset: safeIndex + 1),
+        ChangeSource.local,
+      );
+      _scheduleSave();
+    }
+  }
+
+  Future<void> _pickImage() async {
+    try {
+      final file = await FilePicker.pickFile(type: FileType.image);
+      if (file != null) {
+        final bytes = await file.readAsBytes();
+        if (bytes.isNotEmpty) {
+          await _insertImageBytes(bytes);
         }
       }
-    }
+    } catch (_) {}
   }
 
   @override
@@ -502,7 +567,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
                 ),
               IconButton(
                 icon: const Icon(Icons.image_outlined),
-                tooltip: 'Вставить изображение',
+                tooltip: 'Вставить изображение из файла',
                 onPressed: _pickImage,
               ),
             ],
@@ -539,6 +604,9 @@ class _NoteEditorViewState extends State<NoteEditorView> {
               config: const QuillEditorConfig(
                 placeholder:
                     'Начните писать или вставьте текст / скриншот (Cmd+V)...',
+                embedBuilders: [
+                  ImageEmbedBuilder(),
+                ],
               ),
             ),
           ),
