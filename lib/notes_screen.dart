@@ -41,6 +41,8 @@ class _NotesScreenState extends State<NotesScreen> {
   final _searchController = TextEditingController();
   final _searchFocusNode = FocusNode();
 
+  final ValueNotifier<List<Note>> _notesNotifier =
+      ValueNotifier<List<Note>>([]);
   List<Note> _notes = [];
   bool _isLoading = true;
   String _searchQuery = '';
@@ -70,6 +72,7 @@ class _NotesScreenState extends State<NotesScreen> {
     WebPasteListener.setNewNoteHandler(null);
     _searchController.dispose();
     _searchFocusNode.dispose();
+    _notesNotifier.dispose();
     _realtimeChannel?.unsubscribe();
     super.dispose();
   }
@@ -86,8 +89,9 @@ class _NotesScreenState extends State<NotesScreen> {
       final fetched = (response as List).map((e) => Note.fromMap(e)).toList();
 
       if (mounted) {
+        _notes = fetched;
+        _notesNotifier.value = List.of(_notes);
         setState(() {
-          _notes = fetched;
           _isLoading = false;
           if (_selectedNote != null) {
             final match = _notes.where((n) => n.id == _selectedNote!.id);
@@ -131,36 +135,35 @@ class _NotesScreenState extends State<NotesScreen> {
       final newNote = Note.fromMap(newRecord);
       final exists = _notes.any((n) => n.id == newNote.id);
       if (!exists) {
-        setState(() {
-          _notes.insert(0, newNote);
-        });
+        _notes.insert(0, newNote);
+        _notesNotifier.value = List.of(_notes);
       }
     } else if (payload.eventType == PostgresChangeEvent.update) {
       final updatedRecord = payload.newRecord;
       final updatedNote = Note.fromMap(updatedRecord);
 
+      // Если это открытая заметка, не перезаписываем её — пользователь сейчас печатает
+      if (_selectedNote?.id == updatedNote.id) {
+        return;
+      }
+
       final index = _notes.indexWhere((n) => n.id == updatedNote.id);
       if (index != -1) {
-        // Если это текущая открытая заметка, обновляем только метаданные,
-        // чтобы не сбивать активный ввод текста
-        final isCurrentSelected = _selectedNote?.id == updatedNote.id;
-        if (!isCurrentSelected) {
-          setState(() {
-            _notes[index] = updatedNote;
-            _notes.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
-          });
-        }
+        _notes[index] = updatedNote;
+        _notes.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+        _notesNotifier.value = List.of(_notes);
       }
     } else if (payload.eventType == PostgresChangeEvent.delete) {
       final oldRecord = payload.oldRecord;
       final deletedId = oldRecord['id'] as String?;
       if (deletedId != null) {
-        setState(() {
-          _notes.removeWhere((n) => n.id == deletedId);
-          if (_selectedNote?.id == deletedId) {
+        _notes.removeWhere((n) => n.id == deletedId);
+        _notesNotifier.value = List.of(_notes);
+        if (_selectedNote?.id == deletedId) {
+          setState(() {
             _selectedNote = _notes.isNotEmpty ? _notes.first : null;
-          }
-        });
+          });
+        }
       }
     }
   }
@@ -175,13 +178,8 @@ class _NotesScreenState extends State<NotesScreen> {
         content: newContent,
         updatedAt: DateTime.now(),
       );
-      setState(() {
-        _notes.removeAt(index);
-        _notes.insert(0, updated);
-        if (_selectedNote?.id == noteId) {
-          _selectedNote = updated;
-        }
-      });
+      _notes[index] = updated;
+      _notesNotifier.value = List.of(_notes);
     }
   }
 
@@ -197,8 +195,9 @@ class _NotesScreenState extends State<NotesScreen> {
       updatedAt: DateTime.now(),
     );
 
+    _notes.insert(0, newNote);
+    _notesNotifier.value = List.of(_notes);
     setState(() {
-      _notes.insert(0, newNote);
       _selectedNote = newNote;
     });
 
@@ -258,12 +257,13 @@ class _NotesScreenState extends State<NotesScreen> {
   }
 
   Future<void> _deleteNote(String noteId) async {
-    setState(() {
-      _notes.removeWhere((n) => n.id == noteId);
-      if (_selectedNote?.id == noteId) {
+    _notes.removeWhere((n) => n.id == noteId);
+    _notesNotifier.value = List.of(_notes);
+    if (_selectedNote?.id == noteId) {
+      setState(() {
         _selectedNote = _notes.isNotEmpty ? _notes.first : null;
-      }
-    });
+      });
+    }
 
     try {
       await Supabase.instance.client.from('notes').delete().eq('id', noteId);
@@ -339,7 +339,18 @@ class _NotesScreenState extends State<NotesScreen> {
                     _buildSidebarHeader(isDark),
                     _buildSearchBar(isDark),
                     Expanded(
-                      child: _buildNotesListView(filteredNotes, isDark, isDesktop),
+                      child: ValueListenableBuilder<List<Note>>(
+                        valueListenable: _notesNotifier,
+                        builder: (context, notesList, _) {
+                          final filteredNotes = notesList.where((n) {
+                            if (_searchQuery.isEmpty) return true;
+                            return n.title.toLowerCase().contains(_searchQuery) ||
+                                n.plainText.toLowerCase().contains(_searchQuery);
+                          }).toList();
+                          return _buildNotesListView(
+                              filteredNotes, isDark, isDesktop);
+                        },
+                      ),
                     ),
                   ],
                 ),
@@ -391,22 +402,28 @@ class _NotesScreenState extends State<NotesScreen> {
             ),
           ),
           const SizedBox(width: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-            decoration: BoxDecoration(
-              color: isDark
-                  ? Colors.white.withAlpha(16)
-                  : Colors.black.withAlpha(10),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Text(
-              '${_notes.length}',
-              style: TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-                color: isDark ? Colors.white70 : Colors.black54,
-              ),
-            ),
+          ValueListenableBuilder<List<Note>>(
+            valueListenable: _notesNotifier,
+            builder: (context, notesList, _) {
+              return Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: isDark
+                      ? Colors.white.withAlpha(16)
+                      : Colors.black.withAlpha(10),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  '${notesList.length}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: isDark ? Colors.white70 : Colors.black54,
+                  ),
+                ),
+              );
+            },
           ),
           const Spacer(),
           IconButton(
@@ -1142,21 +1159,11 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   }
 
   void _onTitleChanged() {
-    _notifyLocalChange();
     _scheduleSave();
   }
 
   void _onContentChanged() {
-    _notifyLocalChange();
     _scheduleSave();
-  }
-
-  void _notifyLocalChange() {
-    final title = _titleController.text.trim();
-    final plainText = _quillController.document.toPlainText().trim();
-    final content = jsonEncode(_quillController.document.toDelta().toJson());
-
-    widget.onNoteUpdated?.call(widget.note.id, title, plainText, content);
   }
 
   void _scheduleSave() {
@@ -1180,6 +1187,9 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
     try {
       final plainText = _quillController.document.toPlainText().trim();
+
+      // Уведомляем сайдбар о сохранении новых данных
+      widget.onNoteUpdated?.call(widget.note.id, title, plainText, content);
 
       await Supabase.instance.client.from('notes').upsert({
         'id': widget.note.id,
