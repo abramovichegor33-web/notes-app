@@ -6,7 +6,18 @@ import 'package:web/web.dart' as web;
 typedef ImagePasteCallback = void Function(Uint8List bytes);
 
 class WebPasteListener {
-  static void register(ImagePasteCallback onImage) {
+  static ImagePasteCallback? _currentHandler;
+  static bool _initialized = false;
+
+  static void setHandler(ImagePasteCallback? handler) {
+    _currentHandler = handler;
+    _initOnce();
+  }
+
+  static void _initOnce() {
+    if (_initialized) return;
+    _initialized = true;
+
     web.window.addEventListener(
       'flutter_image_paste',
       (web.Event e) {
@@ -14,12 +25,14 @@ class WebPasteListener {
           final customEvent = e as web.CustomEvent;
           final detail = customEvent.detail;
           if (detail != null) {
-            final dataUrl = (detail as JSString).toDart;
+            final String dataUrl = detail.isA<JSString>()
+                ? (detail as JSString).toDart
+                : detail.toString();
             final commaIndex = dataUrl.indexOf(',');
             if (commaIndex != -1) {
               final base64Str = dataUrl.substring(commaIndex + 1);
               final bytes = base64Decode(base64Str);
-              onImage(bytes);
+              _currentHandler?.call(bytes);
             }
           }
         } catch (_) {}

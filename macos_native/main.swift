@@ -130,6 +130,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
+
         webView = WKWebView(frame: window.contentView!.bounds, configuration: config)
         webView.autoresizingMask = [.width, .height]
         window.contentView?.addSubview(webView)
@@ -152,6 +153,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    @objc func pasteAction(_ sender: Any?) {
+        let pb = NSPasteboard.general
+        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil), let image = images.first as? NSImage {
+            if let tiff = image.tiffRepresentation,
+               let bitmap = NSBitmapImageRep(data: tiff),
+               let pngData = bitmap.representation(using: .png, properties: [:]) {
+                let base64 = pngData.base64EncodedString()
+                let dataUrl = "data:image/png;base64,\(base64)"
+                let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
+                webView.evaluateJavaScript(js, completionHandler: nil)
+                return
+            }
+        }
+
+        NSApp.sendAction(Selector(("paste:")), to: nil, from: sender)
+    }
+
     private func setupMainMenu() {
         let mainMenu = NSMenu()
         let appMenuItem = NSMenuItem()
@@ -171,7 +189,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(NSMenuItem.separator())
         editMenu.addItem(withTitle: "Вырезать", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Скопировать", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "Вставить", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        
+        let pasteItem = editMenu.addItem(withTitle: "Вставить", action: #selector(pasteAction(_:)), keyEquivalent: "v")
+        pasteItem.target = self
+
         editMenu.addItem(withTitle: "Выбрать всё", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 
         NSApp.mainMenu = mainMenu

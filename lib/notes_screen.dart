@@ -309,43 +309,130 @@ class NoteEditorPage extends StatelessWidget {
   }
 }
 
-class ImageEmbedBuilder extends EmbedBuilder {
-  const ImageEmbedBuilder();
+
+class AppImageEmbedBuilder extends EmbedBuilder {
+  const AppImageEmbedBuilder();
 
   @override
   String get key => BlockEmbed.imageType;
 
   @override
+  bool get expanded => false;
+
+  @override
   Widget build(BuildContext context, EmbedContext embedContext) {
-    final imageUrl = embedContext.node.value.data as String;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(8),
-        child: Image.network(
-          imageUrl,
-          fit: BoxFit.contain,
-          errorBuilder: (context, error, stackTrace) => const Row(
-            children: [
-              Icon(Icons.broken_image, color: Colors.grey),
-              SizedBox(width: 8),
-              Text('Не удалось загрузить изображение',
-                  style: TextStyle(color: Colors.grey)),
-            ],
+    final imageSource = embedContext.node.value.data.toString();
+
+    Widget imageWidget;
+    if (imageSource.startsWith('data:image/') || imageSource.contains('base64')) {
+      final base64String =
+          imageSource.contains(',') ? imageSource.split(',')[1] : imageSource;
+      imageWidget = Image.memory(
+        base64Decode(base64String),
+        fit: BoxFit.contain,
+      );
+    } else {
+      imageWidget = Image.network(
+        imageSource,
+        fit: BoxFit.contain,
+        loadingBuilder: (context, child, loadingProgress) {
+          if (loadingProgress == null) return child;
+          return Container(
+            height: 150,
+            width: 200,
+            color: Colors.black12,
+            child: const Center(
+              child: SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+          );
+        },
+        errorBuilder: (context, error, stackTrace) => Container(
+          height: 100,
+          width: 250,
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: Colors.red.withAlpha(20),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.red.withAlpha(60)),
           ),
-          loadingBuilder: (_, child, loadingProgress) {
-            if (loadingProgress == null) return child;
-            return const Padding(
-              padding: EdgeInsets.all(16.0),
-              child: Center(
-                child: SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+          child: const Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.broken_image, color: Colors.red),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Не удалось загрузить изображение',
+                  style: TextStyle(fontSize: 12),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
-            );
-          },
+            ],
+          ),
+        ),
+      );
+    }
+
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: GestureDetector(
+        onTap: () {
+          showDialog(
+            context: context,
+            builder: (_) => Dialog(
+              backgroundColor: Colors.transparent,
+              insetPadding: const EdgeInsets.all(24),
+              child: Stack(
+                alignment: Alignment.topRight,
+                children: [
+                  Center(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: InteractiveViewer(
+                        child: imageWidget,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white, size: 28),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(
+              maxWidth: 550,
+              maxHeight: 450,
+            ),
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: isDark ? Colors.white38 : Colors.black26,
+                  width: 1.5,
+                ),
+                color: isDark
+                    ? Colors.white.withAlpha(12)
+                    : Colors.black.withAlpha(8),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(6.5),
+                child: imageWidget,
+              ),
+            ),
+          ),
         ),
       ),
     );
@@ -407,7 +494,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     _docChangeSub = _quillController.changes.listen((_) => _scheduleSave());
 
     // Слушатель веб-события вставки изображения (Cmd+V в браузере/WebView)
-    WebPasteListener.register((bytes) {
+    WebPasteListener.setHandler((bytes) {
       if (mounted) {
         _insertImageBytes(bytes);
       }
@@ -422,6 +509,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
   @override
   void dispose() {
+    WebPasteListener.setHandler(null);
     _debounceTimer?.cancel();
     _docChangeSub?.cancel();
     _saveNote(updateUi: false);
@@ -527,14 +615,16 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
   Future<void> _pickImage() async {
     try {
-      final file = await FilePicker.pickFile(type: FileType.image);
-      if (file != null) {
-        final bytes = await file.readAsBytes();
+      final files = await FilePicker.pickFiles(type: FileType.image);
+      if (files.isNotEmpty) {
+        final bytes = await files.first.readAsBytes();
         if (bytes.isNotEmpty) {
           await _insertImageBytes(bytes);
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('Error picking image: $e');
+    }
   }
 
   @override
@@ -605,7 +695,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
                 placeholder:
                     'Начните писать или вставьте текст / скриншот (Cmd+V)...',
                 embedBuilders: [
-                  ImageEmbedBuilder(),
+                  AppImageEmbedBuilder(),
                 ],
               ),
             ),
