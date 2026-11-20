@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_quill/flutter_quill.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'notes_screen.dart';
 import 'vault_service.dart';
@@ -36,7 +38,9 @@ class _NotesAppState extends State<NotesApp> {
 
   Future<void> _loadVault() async {
     final id = await VaultService.getOrCreateVaultId();
-    setState(() => _vaultId = id);
+    if (mounted) {
+      setState(() => _vaultId = id);
+    }
   }
 
   @override
@@ -44,6 +48,16 @@ class _NotesAppState extends State<NotesApp> {
     return MaterialApp(
       title: 'Заметки',
       debugShowCheckedModeBanner: false,
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+        FlutterQuillLocalizations.delegate,
+      ],
+      supportedLocales: const [
+        Locale('en', 'US'),
+        Locale('ru', 'RU'),
+      ],
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
           seedColor: Colors.deepPurple,

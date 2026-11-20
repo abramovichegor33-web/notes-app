@@ -11,18 +11,23 @@ final class StaticFileServer {
         self.rootDir = rootDir
         let chosenPort: UInt16 = 52831
         let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
         self.listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: chosenPort)!)
         self.port = chosenPort
 
         listener.newConnectionHandler = { [weak self] connection in
             self?.handleConnection(connection)
         }
-        listener.start(queue: .global(qos: .userInitiated))
+        listener.start(queue: .global(qos: .userInteractive))
     }
 
     private func handleConnection(_ connection: NWConnection) {
-        connection.start(queue: .global(qos: .userInitiated))
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, _ in
+        connection.start(queue: .global(qos: .userInteractive))
+        receiveNext(on: connection)
+    }
+
+    private func receiveNext(on connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, isComplete, _ in
             guard let self = self, let data = data, let request = String(data: data, encoding: .utf8) else {
                 connection.cancel()
                 return
@@ -57,6 +62,9 @@ final class StaticFileServer {
                 headers += "Content-Type: \(mime)\r\n"
                 headers += "Content-Length: \(fileData.count)\r\n"
                 headers += "Access-Control-Allow-Origin: *\r\n"
+                headers += "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+                headers += "Pragma: no-cache\r\n"
+                headers += "Expires: 0\r\n"
                 headers += "Connection: close\r\n\r\n"
 
                 var responseData = headers.data(using: .utf8)!
@@ -127,8 +135,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView?.addSubview(webView)
 
         if let url = URL(string: "http://127.0.0.1:\(port)/index.html") {
-            let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
-            webView.load(request)
+            WKWebsiteDataStore.default().removeData(
+                ofTypes: [WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache],
+                modifiedSince: Date.distantPast
+            ) { [weak self] in
+                let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+                self?.webView.load(request)
+            }
         }
 
         window.makeKeyAndOrderFront(nil)

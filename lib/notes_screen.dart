@@ -4,7 +4,6 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_quill/flutter_quill.dart';
-import 'package:pasteboard/pasteboard.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'note_model.dart';
 import 'sync_dialog.dart';
@@ -27,6 +26,29 @@ class _NotesScreenState extends State<NotesScreen> {
   final _searchController = TextEditingController();
   String _searchQuery = '';
   Note? _selectedNote;
+  late Stream<List<Map<String, dynamic>>> _notesStream;
+
+  @override
+  void initState() {
+    super.initState();
+    _initStream();
+  }
+
+  void _initStream() {
+    _notesStream = Supabase.instance.client
+        .from('notes')
+        .stream(primaryKey: ['id'])
+        .eq('vault_id', widget.vaultId)
+        .order('updated_at', ascending: false);
+  }
+
+  @override
+  void didUpdateWidget(covariant NotesScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.vaultId != widget.vaultId) {
+      _initStream();
+    }
+  }
 
   @override
   void dispose() {
@@ -60,8 +82,6 @@ class _NotesScreenState extends State<NotesScreen> {
             builder: (_) => NoteEditorPage(
               note: createdNote,
               vaultId: widget.vaultId,
-              onNoteUpdated: (updated) =>
-                  setState(() => _selectedNote = updated),
             ),
           ),
         );
@@ -70,7 +90,7 @@ class _NotesScreenState extends State<NotesScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Ошибка: $e'),
+            content: Text('Ошибка создания заметки: $e'),
             backgroundColor: Colors.red,
           ),
         );
@@ -144,9 +164,6 @@ class _NotesScreenState extends State<NotesScreen> {
                       key: ValueKey(_selectedNote!.id),
                       note: _selectedNote!,
                       vaultId: widget.vaultId,
-                      onNoteUpdated: (updated) {
-                        setState(() => _selectedNote = updated);
-                      },
                     ),
             ),
           ],
@@ -188,11 +205,7 @@ class _NotesScreenState extends State<NotesScreen> {
         ),
         Expanded(
           child: StreamBuilder<List<Map<String, dynamic>>>(
-            stream: Supabase.instance.client
-                .from('notes')
-                .stream(primaryKey: ['id'])
-                .eq('vault_id', widget.vaultId)
-                .order('updated_at', ascending: false),
+            stream: _notesStream,
             builder: (context, snapshot) {
               if (snapshot.connectionState == ConnectionState.waiting) {
                 return const Center(child: CircularProgressIndicator());
@@ -255,9 +268,6 @@ class _NotesScreenState extends State<NotesScreen> {
                             builder: (_) => NoteEditorPage(
                               note: note,
                               vaultId: widget.vaultId,
-                              onNoteUpdated: (updated) {
-                                setState(() => _selectedNote = updated);
-                              },
                             ),
                           ),
                         );
@@ -277,13 +287,11 @@ class _NotesScreenState extends State<NotesScreen> {
 class NoteEditorPage extends StatelessWidget {
   final Note note;
   final String vaultId;
-  final ValueChanged<Note> onNoteUpdated;
 
   const NoteEditorPage({
     super.key,
     required this.note,
     required this.vaultId,
-    required this.onNoteUpdated,
   });
 
   @override
@@ -295,7 +303,6 @@ class NoteEditorPage extends StatelessWidget {
       body: NoteEditorView(
         note: note,
         vaultId: vaultId,
-        onNoteUpdated: onNoteUpdated,
       ),
     );
   }
@@ -304,13 +311,11 @@ class NoteEditorPage extends StatelessWidget {
 class NoteEditorView extends StatefulWidget {
   final Note note;
   final String vaultId;
-  final ValueChanged<Note> onNoteUpdated;
 
   const NoteEditorView({
     super.key,
     required this.note,
     required this.vaultId,
-    required this.onNoteUpdated,
   });
 
   @override
@@ -320,12 +325,24 @@ class NoteEditorView extends StatefulWidget {
 class _NoteEditorViewState extends State<NoteEditorView> {
   late TextEditingController _titleController;
   late QuillController _quillController;
+  StreamSubscription? _docChangeSub;
   Timer? _debounceTimer;
+  String _lastSavedTitle = '';
+  String _lastSavedContent = '';
+  bool _isSaving = false;
 
   @override
   void initState() {
     super.initState();
     _titleController = TextEditingController(text: widget.note.title);
+    _lastSavedTitle = widget.note.title;
+    _lastSavedContent = widget.note.content;
+
+    final controllerConfig = QuillControllerConfig(
+      clipboardConfig: QuillClipboardConfig(
+        onImagePaste: _onImagePaste,
+      ),
+    );
 
     if (widget.note.content.isNotEmpty) {
       try {
@@ -333,21 +350,30 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         _quillController = QuillController(
           document: Document.fromJson(decoded),
           selection: const TextSelection.collapsed(offset: 0),
+          config: controllerConfig,
         );
       } catch (_) {
-        _quillController = QuillController.basic();
+        _quillController = QuillController.basic(config: controllerConfig);
       }
     } else {
-      _quillController = QuillController.basic();
+      _quillController = QuillController.basic(config: controllerConfig);
     }
 
-    _titleController.addListener(_scheduleSave);
-    _quillController.addListener(_scheduleSave);
+    _titleController.addListener(_onTitleChanged);
+    _docChangeSub = _quillController.changes.listen((_) => _scheduleSave());
+  }
+
+  void _onTitleChanged() {
+    if (_titleController.text.trim() != _lastSavedTitle) {
+      _scheduleSave();
+    }
   }
 
   @override
   void dispose() {
     _debounceTimer?.cancel();
+    _docChangeSub?.cancel();
+    _saveNote(updateUi: false);
     _titleController.dispose();
     _quillController.dispose();
     super.dispose();
@@ -355,25 +381,26 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
   void _scheduleSave() {
     _debounceTimer?.cancel();
-    _debounceTimer = Timer(const Duration(milliseconds: 500), _saveNote);
+    _debounceTimer = Timer(const Duration(milliseconds: 1200), _saveNote);
   }
 
-  Future<void> _saveNote() async {
+  Future<void> _saveNote({bool updateUi = true}) async {
+    final title = _titleController.text.trim();
+    final content = jsonEncode(_quillController.document.toDelta().toJson());
+
+    if (title == _lastSavedTitle && content == _lastSavedContent) {
+      return;
+    }
+
+    _lastSavedTitle = title;
+    _lastSavedContent = content;
+
+    if (updateUi && mounted) {
+      setState(() => _isSaving = true);
+    }
+
     try {
-      final title = _titleController.text.trim();
-      final content = jsonEncode(_quillController.document.toDelta().toJson());
       final plainText = _quillController.document.toPlainText().trim();
-
-      final updated = Note(
-        id: widget.note.id,
-        vaultId: widget.vaultId,
-        title: title,
-        content: content,
-        plainText: plainText,
-        updatedAt: DateTime.now(),
-      );
-
-      widget.onNoteUpdated(updated);
 
       await Supabase.instance.client.from('notes').upsert({
         'id': widget.note.id,
@@ -383,10 +410,15 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         'plain_text': plainText,
         'updated_at': DateTime.now().toIso8601String(),
       });
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      if (updateUi && mounted) {
+        setState(() => _isSaving = false);
+      }
+    }
   }
 
-  Future<void> _uploadAndInsertImage(Uint8List bytes) async {
+  Future<String?> _onImagePaste(Uint8List bytes) async {
     try {
       final fileName = '${DateTime.now().millisecondsSinceEpoch}.png';
       final storagePath = '${widget.vaultId}/$fileName';
@@ -401,20 +433,14 @@ class _NoteEditorViewState extends State<NoteEditorView> {
           .from('note-images')
           .getPublicUrl(storagePath);
 
-      final index = _quillController.selection.baseOffset;
-      final length = _quillController.selection.extentOffset - index;
-      _quillController.replaceText(
-        index < 0 ? _quillController.document.length - 1 : index,
-        length < 0 ? 0 : length,
-        BlockEmbed.image(publicUrl),
-        null,
-      );
+      return publicUrl;
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Не удалось загрузить изображение')),
         );
       }
+      return null;
     }
   }
 
@@ -423,76 +449,101 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     if (file != null) {
       final bytes = await file.readAsBytes();
       if (bytes.isNotEmpty) {
-        await _uploadAndInsertImage(bytes);
+        final url = await _onImagePaste(bytes);
+        if (url != null) {
+          final index = _quillController.selection.baseOffset;
+          final length = _quillController.selection.extentOffset - index;
+          final safeIndex =
+              index < 0 ? _quillController.document.length - 1 : index;
+          final safeLength = length < 0 ? 0 : length;
+
+          _quillController.replaceText(
+            safeIndex,
+            safeLength,
+            BlockEmbed.image(url),
+            null,
+          );
+          _quillController.updateSelection(
+            TextSelection.collapsed(offset: safeIndex + 1),
+            ChangeSource.local,
+          );
+        }
       }
     }
   }
 
-  Future<void> _handlePasteImage() async {
-    try {
-      final imageBytes = await Pasteboard.image;
-      if (imageBytes != null && imageBytes.isNotEmpty) {
-        await _uploadAndInsertImage(imageBytes);
-      }
-    } catch (_) {}
-  }
-
   @override
   Widget build(BuildContext context) {
-    return CallbackShortcuts(
-      bindings: {
-        const SingleActivator(LogicalKeyboardKey.keyV, meta: true):
-            _handlePasteImage,
-        const SingleActivator(LogicalKeyboardKey.keyV, control: true):
-            _handlePasteImage,
-      },
-      child: Focus(
-        autofocus: true,
-        child: Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _titleController,
-                      style: const TextStyle(
-                          fontSize: 22, fontWeight: FontWeight.bold),
-                      decoration: const InputDecoration(
-                        hintText: 'Заголовок заметки',
-                        border: InputBorder.none,
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.image_outlined),
-                    tooltip: 'Вставить изображение',
-                    onPressed: _pickImage,
-                  ),
-                ],
-              ),
-            ),
-            QuillSimpleToolbar(
-              controller: _quillController,
-              config: const QuillSimpleToolbarConfig(),
-            ),
-            const Divider(height: 1),
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: QuillEditor.basic(
-                  controller: _quillController,
-                  config: const QuillEditorConfig(
-                    placeholder:
-                        'Начните писать или вставьте изображение (Cmd+V)...',
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _titleController,
+                  style: const TextStyle(
+                      fontSize: 22, fontWeight: FontWeight.bold),
+                  decoration: const InputDecoration(
+                    hintText: 'Заголовок заметки',
+                    border: InputBorder.none,
                   ),
                 ),
               ),
-            ),
-          ],
+              if (_isSaving)
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8.0),
+                  child: SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
+              IconButton(
+                icon: const Icon(Icons.image_outlined),
+                tooltip: 'Вставить изображение',
+                onPressed: _pickImage,
+              ),
+            ],
+          ),
         ),
-      ),
+        QuillSimpleToolbar(
+          controller: _quillController,
+          config: const QuillSimpleToolbarConfig(
+            showFontFamily: false,
+            showFontSize: false,
+            showColorButton: false,
+            showBackgroundColorButton: false,
+            showSubscript: false,
+            showSuperscript: false,
+            showSearchButton: false,
+            showInlineCode: false,
+            showCodeBlock: false,
+            showAlignmentButtons: false,
+            showDirection: false,
+            showLink: false,
+            showListCheck: true,
+            showListBullets: true,
+            showListNumbers: true,
+            showQuote: true,
+            showIndent: false,
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: QuillEditor.basic(
+              controller: _quillController,
+              config: const QuillEditorConfig(
+                placeholder:
+                    'Начните писать или вставьте текст / скриншот (Cmd+V)...',
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

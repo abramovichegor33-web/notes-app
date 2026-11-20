@@ -52,8 +52,9 @@ cat << 'EOF' > "$APP_DIR/Contents/Info.plist"
 </plist>
 EOF
 
+codesign --force --deep --sign - "$APP_DIR"
+
 ln -s /Applications "$BUILD_DIR/Applications"
 
 hdiutil create -volname "$APP_NAME" -srcfolder "$BUILD_DIR" -ov -format UDZO "$DMG_PATH"
 echo "DMG created at $DMG_PATH"
-ls -lh "$DMG_PATH"
