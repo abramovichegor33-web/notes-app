@@ -35,44 +35,58 @@ class _NotesScreenState extends State<NotesScreen> {
   }
 
   Future<void> _createNewNote() async {
-    final newNoteData = {
-      'vault_id': widget.vaultId,
-      'title': 'Новая заметка',
-      'content': '',
-      'plain_text': '',
-    };
+    try {
+      final newNoteData = {
+        'vault_id': widget.vaultId,
+        'title': 'Новая заметка',
+        'content': '',
+        'plain_text': '',
+      };
 
-    final response = await Supabase.instance.client
-        .from('notes')
-        .insert(newNoteData)
-        .select()
-        .single();
+      final response = await Supabase.instance.client
+          .from('notes')
+          .insert(newNoteData)
+          .select()
+          .single();
 
-    final createdNote = Note.fromMap(response);
-    setState(() {
-      _selectedNote = createdNote;
-    });
+      final createdNote = Note.fromMap(response);
+      setState(() {
+        _selectedNote = createdNote;
+      });
 
-    if (mounted && MediaQuery.of(context).size.width < 700) {
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => NoteEditorPage(
-            note: createdNote,
-            vaultId: widget.vaultId,
-            onNoteUpdated: (updated) => setState(() => _selectedNote = updated),
+      if (mounted && MediaQuery.of(context).size.width < 700) {
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => NoteEditorPage(
+              note: createdNote,
+              vaultId: widget.vaultId,
+              onNoteUpdated: (updated) =>
+                  setState(() => _selectedNote = updated),
+            ),
           ),
-        ),
-      );
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
   Future<void> _deleteNote(String noteId) async {
-    await Supabase.instance.client.from('notes').delete().eq('id', noteId);
-    if (_selectedNote?.id == noteId) {
-      setState(() {
-        _selectedNote = null;
-      });
-    }
+    try {
+      await Supabase.instance.client.from('notes').delete().eq('id', noteId);
+      if (_selectedNote?.id == noteId) {
+        setState(() {
+          _selectedNote = null;
+        });
+      }
+    } catch (_) {}
   }
 
   void _openSyncDialog() {
@@ -345,29 +359,31 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   }
 
   Future<void> _saveNote() async {
-    final title = _titleController.text.trim();
-    final content = jsonEncode(_quillController.document.toDelta().toJson());
-    final plainText = _quillController.document.toPlainText().trim();
+    try {
+      final title = _titleController.text.trim();
+      final content = jsonEncode(_quillController.document.toDelta().toJson());
+      final plainText = _quillController.document.toPlainText().trim();
 
-    final updated = Note(
-      id: widget.note.id,
-      vaultId: widget.vaultId,
-      title: title,
-      content: content,
-      plainText: plainText,
-      updatedAt: DateTime.now(),
-    );
+      final updated = Note(
+        id: widget.note.id,
+        vaultId: widget.vaultId,
+        title: title,
+        content: content,
+        plainText: plainText,
+        updatedAt: DateTime.now(),
+      );
 
-    widget.onNoteUpdated(updated);
+      widget.onNoteUpdated(updated);
 
-    await Supabase.instance.client.from('notes').upsert({
-      'id': widget.note.id,
-      'vault_id': widget.vaultId,
-      'title': title,
-      'content': content,
-      'plain_text': plainText,
-      'updated_at': DateTime.now().toIso8601String(),
-    });
+      await Supabase.instance.client.from('notes').upsert({
+        'id': widget.note.id,
+        'vault_id': widget.vaultId,
+        'title': title,
+        'content': content,
+        'plain_text': plainText,
+        'updated_at': DateTime.now().toIso8601String(),
+      });
+    } catch (_) {}
   }
 
   Future<void> _uploadAndInsertImage(Uint8List bytes) async {
