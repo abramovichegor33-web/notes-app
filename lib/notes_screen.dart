@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -1617,15 +1618,65 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     super.dispose();
   }
 
+  Future<Uint8List> _optimizeImageBytes(Uint8List bytes) async {
+    try {
+      if (bytes.length < 300 * 1024) {
+        return bytes;
+      }
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      final image = frame.image;
+      final width = image.width;
+      final height = image.height;
+
+      const maxDim = 1600;
+      if (width <= maxDim && height <= maxDim) {
+        return bytes;
+      }
+
+      int targetWidth = width;
+      int targetHeight = height;
+      if (width > height) {
+        targetWidth = maxDim;
+        targetHeight = (height * maxDim / width).round();
+      } else {
+        targetHeight = maxDim;
+        targetWidth = (width * maxDim / height).round();
+      }
+
+      final targetCodec = await ui.instantiateImageCodec(
+        bytes,
+        targetWidth: targetWidth,
+        targetHeight: targetHeight,
+      );
+      final targetFrame = await targetCodec.getNextFrame();
+      final targetImg = targetFrame.image;
+      final byteData =
+          await targetImg.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData != null) {
+        return byteData.buffer.asUint8List();
+      }
+    } catch (e) {
+      debugPrint('Optimization error: $e');
+    }
+    return bytes;
+  }
+
   Future<String?> _uploadImageToStorage(Uint8List bytes) async {
     try {
-      final fileName = '${DateTime.now().millisecondsSinceEpoch}.png';
+      final optimized = await _optimizeImageBytes(bytes);
+      final isJpeg =
+          optimized.length > 2 && optimized[0] == 0xFF && optimized[1] == 0xD8;
+      final ext = isJpeg ? 'jpg' : 'png';
+      final mime = isJpeg ? 'image/jpeg' : 'image/png';
+
+      final fileName = '${DateTime.now().millisecondsSinceEpoch}.$ext';
       final storagePath = '${widget.vaultId}/$fileName';
 
       await Supabase.instance.client.storage.from('note-images').uploadBinary(
             storagePath,
-            bytes,
-            fileOptions: const FileOptions(contentType: 'image/png'),
+            optimized,
+            fileOptions: FileOptions(contentType: mime),
           );
 
       return Supabase.instance.client.storage
@@ -1636,30 +1687,70 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     }
   }
 
-  Future<void> _insertImageBytes(Uint8List bytes) async {
-    _isSavingNotifier.value = true;
-    final cloudUrl = await _uploadImageToStorage(bytes);
-    _isSavingNotifier.value = false;
-
-    if (cloudUrl != null && mounted) {
-      final index = _quillController.selection.baseOffset;
-      final length = _quillController.selection.extentOffset - index;
-      final safeIndex =
-          index < 0 ? _quillController.document.length - 1 : index;
-      final safeLength = length < 0 ? 0 : length;
-
-      _quillController.replaceText(
-        safeIndex,
-        safeLength,
-        BlockEmbed.image(cloudUrl),
-        null,
-      );
+  void _replaceImageSourceInDocument(String oldSource, String newSource) {
+    final jsonList = _quillController.document.toDelta().toJson();
+    bool found = false;
+    for (final item in jsonList) {
+      if (item is Map) {
+        final insert = item['insert'];
+        if (insert is Map && insert['image'] == oldSource) {
+          insert['image'] = newSource;
+          found = true;
+        }
+      }
+    }
+    if (found) {
+      final oldSelection = _quillController.selection;
+      _docChangeSub?.pause();
+      _quillController.document = Document.fromJson(jsonList);
+      final maxOffset = _quillController.document.length - 1;
+      final safeOffset =
+          oldSelection.baseOffset.clamp(0, maxOffset < 0 ? 0 : maxOffset);
       _quillController.updateSelection(
-        TextSelection.collapsed(offset: safeIndex + 1),
+        TextSelection.collapsed(offset: safeOffset),
         ChangeSource.local,
       );
-      _onContentChanged();
-      _saveNote();
+      _docChangeSub?.resume();
+    }
+  }
+
+  Future<void> _insertImageBytes(Uint8List bytes) async {
+    final index = _quillController.selection.baseOffset;
+    final length = _quillController.selection.extentOffset - index;
+    final safeIndex =
+        index < 0 ? _quillController.document.length - 1 : index;
+    final safeLength = length < 0 ? 0 : length;
+
+    // 1. МГНОВЕННОЕ локальное превью (0 мс задержки!)
+    final isJpeg = bytes.length > 2 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+    final mime = isJpeg ? 'image/jpeg' : 'image/png';
+    final tempBase64 = base64Encode(bytes);
+    final localDataUrl = 'data:$mime;base64,$tempBase64';
+
+    _quillController.replaceText(
+      safeIndex,
+      safeLength,
+      BlockEmbed.image(localDataUrl),
+      null,
+    );
+    _quillController.updateSelection(
+      TextSelection.collapsed(offset: safeIndex + 1),
+      ChangeSource.local,
+    );
+    _onContentChanged();
+
+    // 2. Фоновая оптимизированная загрузка в Supabase Storage
+    _isSavingNotifier.value = true;
+    try {
+      final cloudUrl = await _uploadImageToStorage(bytes);
+      if (cloudUrl != null && mounted) {
+        // Подменяем локальный base64 постоянным облачным URL
+        _replaceImageSourceInDocument(localDataUrl, cloudUrl);
+        _saveNote();
+      }
+    } catch (_) {
+    } finally {
+      if (mounted) _isSavingNotifier.value = false;
     }
   }
 

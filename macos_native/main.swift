@@ -186,13 +186,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
         let pb = NSPasteboard.general
         if let images = pb.readObjects(forClasses: [NSImage.self], options: nil), let image = images.first as? NSImage {
             if let tiff = image.tiffRepresentation,
-               let bitmap = NSBitmapImageRep(data: tiff),
-               let pngData = bitmap.representation(using: .png, properties: [:]) {
-                let base64 = pngData.base64EncodedString()
-                let dataUrl = "data:image/png;base64,\(base64)"
-                let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
-                webView.evaluateJavaScript(js, completionHandler: nil)
-                return
+               let bitmap = NSBitmapImageRep(data: tiff) {
+                var rep = bitmap
+                let maxWidth: CGFloat = 1600
+                let maxHeight: CGFloat = 1600
+                let width = CGFloat(bitmap.pixelsWide)
+                let height = CGFloat(bitmap.pixelsHigh)
+
+                if width > maxWidth || height > maxHeight {
+                    let aspectRatio = width / height
+                    var targetWidth = maxWidth
+                    var targetHeight = maxWidth / aspectRatio
+                    if targetHeight > maxHeight {
+                        targetHeight = maxHeight
+                        targetWidth = maxHeight * aspectRatio
+                    }
+                    let newSize = NSSize(width: targetWidth, height: targetHeight)
+                    let resizedImg = NSImage(size: newSize)
+                    resizedImg.lockFocus()
+                    image.draw(in: NSRect(origin: .zero, size: newSize),
+                               from: NSRect(origin: .zero, size: image.size),
+                               operation: .copy,
+                               fraction: 1.0)
+                    resizedImg.unlockFocus()
+                    if let resTiff = resizedImg.tiffRepresentation,
+                       let newRep = NSBitmapImageRep(data: resTiff) {
+                        rep = newRep
+                    }
+                }
+
+                // Быстрое сжатие до компактного JPEG 0.85 (размер в 20-50 раз меньше сырого PNG!)
+                if let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) {
+                    let base64 = jpegData.base64EncodedString()
+                    let dataUrl = "data:image/jpeg;base64,\(base64)"
+                    let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
+                    webView.evaluateJavaScript(js, completionHandler: nil)
+                    return
+                } else if let pngData = rep.representation(using: .png, properties: [:]) {
+                    let base64 = pngData.base64EncodedString()
+                    let dataUrl = "data:image/png;base64,\(base64)"
+                    let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
+                    webView.evaluateJavaScript(js, completionHandler: nil)
+                    return
+                }
             }
         }
 
