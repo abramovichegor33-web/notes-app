@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -11,7 +10,6 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'note_model.dart';
 import 'sync_dialog.dart';
-import 'vault_service.dart';
 import 'web_paste.dart';
 
 String _generateUuid() {
@@ -37,7 +35,7 @@ class NotesScreen extends StatefulWidget {
   State<NotesScreen> createState() => _NotesScreenState();
 }
 
-class _NotesScreenState extends State<NotesScreen> {
+class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   final _searchController = TextEditingController();
   final _searchFocusNode = FocusNode();
 
@@ -53,17 +51,38 @@ class _NotesScreenState extends State<NotesScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WebPasteListener.setNewNoteHandler(_createNewNote);
     _fetchNotes();
     _setupRealtime();
     _startPeriodicSync();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _syncFromCloudSilently();
+      _setupRealtime();
+    }
+  }
+
   void _startPeriodicSync() {
     _periodicSyncTimer?.cancel();
-    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       _syncFromCloudSilently();
     });
+  }
+
+  void _broadcastSync() {
+    try {
+      _realtimeChannel?.sendBroadcastMessage(
+        event: 'sync',
+        payload: {
+          'vault': widget.vaultId,
+          'ts': DateTime.now().millisecondsSinceEpoch,
+        },
+      );
+    } catch (_) {}
   }
 
   Future<void> _syncFromCloudSilently() async {
@@ -75,7 +94,7 @@ class _NotesScreenState extends State<NotesScreen> {
           .order('updated_at', ascending: false);
 
       final cloudNotes =
-          (response as List).map((e) => Note.fromMap(e)).toList();
+          (response as List).map((e) => Note.fromMap(e as Map)).toList();
 
       if (!mounted) return;
 
@@ -85,6 +104,8 @@ class _NotesScreenState extends State<NotesScreen> {
       } else {
         for (int i = 0; i < cloudNotes.length; i++) {
           if (cloudNotes[i].id != _notes[i].id ||
+              cloudNotes[i].title != _notes[i].title ||
+              cloudNotes[i].content != _notes[i].content ||
               cloudNotes[i].updatedAt != _notes[i].updatedAt) {
             hasChanges = true;
             break;
@@ -93,19 +114,29 @@ class _NotesScreenState extends State<NotesScreen> {
       }
 
       if (hasChanges) {
-        final updatedList = <Note>[];
-        for (final cn in cloudNotes) {
-          if (cn.id == _selectedNote?.id) {
-            final local = _notes.where((n) => n.id == cn.id);
-            updatedList.add(local.isNotEmpty ? local.first : cn);
-          } else {
-            updatedList.add(cn);
-          }
-        }
-        _notes = updatedList;
+        _notes = cloudNotes;
         _notesNotifier.value = List.of(_notes);
+
+        if (_selectedNote != null) {
+          final match = _notes.where((n) => n.id == _selectedNote!.id);
+          if (match.isNotEmpty) {
+            setState(() {
+              _selectedNote = match.first;
+            });
+          } else {
+            setState(() {
+              _selectedNote = _notes.isNotEmpty ? _notes.first : null;
+            });
+          }
+        } else if (_notes.isNotEmpty) {
+          setState(() {
+            _selectedNote = _notes.first;
+          });
+        }
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('Sync silently error: $e');
+    }
   }
 
   @override
@@ -113,6 +144,8 @@ class _NotesScreenState extends State<NotesScreen> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.vaultId != widget.vaultId) {
       _selectedNote = null;
+      _notes = [];
+      _notesNotifier.value = [];
       _fetchNotes();
       _setupRealtime();
       _startPeriodicSync();
@@ -121,6 +154,7 @@ class _NotesScreenState extends State<NotesScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _periodicSyncTimer?.cancel();
     WebPasteListener.setNewNoteHandler(null);
     _searchController.dispose();
@@ -139,7 +173,8 @@ class _NotesScreenState extends State<NotesScreen> {
           .eq('vault_id', widget.vaultId)
           .order('updated_at', ascending: false);
 
-      final fetched = (response as List).map((e) => Note.fromMap(e)).toList();
+      final fetched =
+          (response as List).map((e) => Note.fromMap(e as Map)).toList();
 
       if (mounted) {
         _notes = fetched;
@@ -155,7 +190,8 @@ class _NotesScreenState extends State<NotesScreen> {
           }
         });
       }
-    } catch (_) {
+    } catch (e) {
+      debugPrint('Fetch notes error: $e');
       if (mounted) setState(() => _isLoading = false);
     }
   }
@@ -181,8 +217,6 @@ class _NotesScreenState extends State<NotesScreen> {
         .subscribe();
   }
 
-
-
   void _onNoteLocallyUpdated(
       String noteId, String newTitle, String newPlainText, String newContent) {
     final index = _notes.indexWhere((n) => n.id == noteId);
@@ -195,6 +229,9 @@ class _NotesScreenState extends State<NotesScreen> {
       );
       _notes[index] = updated;
       _notesNotifier.value = List.of(_notes);
+      if (_selectedNote?.id == noteId) {
+        _selectedNote = updated;
+      }
     }
   }
 
@@ -218,16 +255,19 @@ class _NotesScreenState extends State<NotesScreen> {
 
     try {
       await Supabase.instance.client.from('notes').insert(newNote.toMap());
+      _broadcastSync();
     } catch (_) {}
 
     if (mounted && MediaQuery.of(context).size.width < 720) {
       Navigator.of(context).push(
         MaterialPageRoute(
           builder: (_) => NoteEditorPage(
-            note: newNote,
+            initialNote: newNote,
             vaultId: widget.vaultId,
+            notesNotifier: _notesNotifier,
             onNoteUpdated: _onNoteLocallyUpdated,
             onNoteDeleted: _deleteNote,
+            onBroadcastSync: _broadcastSync,
           ),
         ),
       );
@@ -282,6 +322,7 @@ class _NotesScreenState extends State<NotesScreen> {
 
     try {
       await Supabase.instance.client.from('notes').delete().eq('id', noteId);
+      _broadcastSync();
     } catch (_) {}
   }
 
@@ -304,12 +345,6 @@ class _NotesScreenState extends State<NotesScreen> {
   Widget build(BuildContext context) {
     final isDesktop = MediaQuery.of(context).size.width >= 720;
     final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    final filteredNotes = _notes.where((n) {
-      if (_searchQuery.isEmpty) return true;
-      return n.title.toLowerCase().contains(_searchQuery) ||
-          n.plainText.toLowerCase().contains(_searchQuery);
-    }).toList();
 
     return CallbackShortcuts(
       bindings: {
@@ -383,6 +418,7 @@ class _NotesScreenState extends State<NotesScreen> {
                           onNoteUpdated: _onNoteLocallyUpdated,
                           onDeleteRequested: () =>
                               _confirmDeleteNote(_selectedNote!),
+                          onBroadcastSync: _broadcastSync,
                         ),
                 ),
             ],
@@ -595,10 +631,12 @@ class _NotesScreenState extends State<NotesScreen> {
               Navigator.of(context).push(
                 MaterialPageRoute(
                   builder: (_) => NoteEditorPage(
-                    note: note,
+                    initialNote: note,
                     vaultId: widget.vaultId,
+                    notesNotifier: _notesNotifier,
                     onNoteUpdated: _onNoteLocallyUpdated,
                     onNoteDeleted: _deleteNote,
+                    onBroadcastSync: _broadcastSync,
                   ),
                 ),
               );
@@ -779,32 +817,51 @@ class _NoteCardItemState extends State<_NoteCardItem> {
 }
 
 class NoteEditorPage extends StatelessWidget {
-  final Note note;
+  final Note initialNote;
   final String vaultId;
+  final ValueNotifier<List<Note>> notesNotifier;
   final Function(String, String, String, String) onNoteUpdated;
   final Function(String) onNoteDeleted;
+  final VoidCallback onBroadcastSync;
 
   const NoteEditorPage({
     super.key,
-    required this.note,
+    required this.initialNote,
     required this.vaultId,
+    required this.notesNotifier,
     required this.onNoteUpdated,
     required this.onNoteDeleted,
+    required this.onBroadcastSync,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(note.title.isEmpty ? 'Заметка' : note.title),
-        elevation: 0,
-      ),
-      body: NoteEditorView(
-        note: note,
-        vaultId: vaultId,
-        onNoteUpdated: onNoteUpdated,
-        onDeleteRequested: () => onNoteDeleted(note.id),
-      ),
+    return ValueListenableBuilder<List<Note>>(
+      valueListenable: notesNotifier,
+      builder: (context, notes, _) {
+        final currentNote = notes.firstWhere(
+          (n) => n.id == initialNote.id,
+          orElse: () => initialNote,
+        );
+        return Scaffold(
+          appBar: AppBar(
+            title:
+                Text(currentNote.title.isEmpty ? 'Заметка' : currentNote.title),
+            elevation: 0,
+          ),
+          body: NoteEditorView(
+            key: ValueKey(currentNote.id),
+            note: currentNote,
+            vaultId: vaultId,
+            onNoteUpdated: onNoteUpdated,
+            onDeleteRequested: () {
+              Navigator.of(context).pop();
+              onNoteDeleted(currentNote.id);
+            },
+            onBroadcastSync: onBroadcastSync,
+          ),
+        );
+      },
     );
   }
 }
@@ -1131,6 +1188,7 @@ class NoteEditorView extends StatefulWidget {
   final String vaultId;
   final Function(String, String, String, String)? onNoteUpdated;
   final VoidCallback? onDeleteRequested;
+  final VoidCallback? onBroadcastSync;
 
   const NoteEditorView({
     super.key,
@@ -1138,6 +1196,7 @@ class NoteEditorView extends StatefulWidget {
     required this.vaultId,
     this.onNoteUpdated,
     this.onDeleteRequested,
+    this.onBroadcastSync,
   });
 
   @override
@@ -1152,6 +1211,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
   String _lastSavedTitle = '';
   String _lastSavedContent = '';
+  DateTime _lastLocalEditTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   final ValueNotifier<bool> _isSavingNotifier = ValueNotifier(false);
   final ValueNotifier<bool> _isSavedNotifier = ValueNotifier(true);
@@ -1195,6 +1255,75 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     });
   }
 
+  @override
+  void didUpdateWidget(covariant NoteEditorView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.note.id != widget.note.id) {
+      _debounceTimer?.cancel();
+      _saveNote();
+
+      _titleController.text = widget.note.title;
+      _lastSavedTitle = widget.note.title;
+      _lastSavedContent = widget.note.content;
+
+      _docChangeSub?.pause();
+      if (widget.note.content.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(widget.note.content);
+          _quillController.document = Document.fromJson(decoded);
+        } catch (_) {
+          _quillController.document = Document();
+        }
+      } else {
+        _quillController.document = Document();
+      }
+      _quillController.updateSelection(
+        const TextSelection.collapsed(offset: 0),
+        ChangeSource.local,
+      );
+      _docChangeSub?.resume();
+      _isSavedNotifier.value = true;
+    } else {
+      final remoteTitle = widget.note.title;
+      final remoteContent = widget.note.content;
+
+      final bool titleChanged =
+          remoteTitle != _lastSavedTitle && remoteTitle != _titleController.text;
+      final bool contentChanged = remoteContent != _lastSavedContent;
+
+      if (titleChanged || contentChanged) {
+        final msSinceLocalEdit =
+            DateTime.now().difference(_lastLocalEditTime).inMilliseconds;
+        // Применяем изменения из облака, если пользователь не печатает прямо в эту секунду
+        if (msSinceLocalEdit > 350) {
+          _lastSavedTitle = remoteTitle;
+          _lastSavedContent = remoteContent;
+          _isSavedNotifier.value = true;
+
+          if (titleChanged) {
+            _titleController.text = remoteTitle;
+          }
+          if (contentChanged && remoteContent.isNotEmpty) {
+            try {
+              final decoded = jsonDecode(remoteContent);
+              final newDoc = Document.fromJson(decoded);
+              _docChangeSub?.pause();
+              final oldSelection = _quillController.selection;
+              _quillController.document = newDoc;
+              final newLen = _quillController.document.length;
+              final safeOffset = oldSelection.baseOffset.clamp(0, newLen - 1);
+              _quillController.updateSelection(
+                TextSelection.collapsed(offset: safeOffset),
+                ChangeSource.local,
+              );
+              _docChangeSub?.resume();
+            } catch (_) {}
+          }
+        }
+      }
+    }
+  }
+
   void _onTitleChanged() {
     _scheduleSave();
   }
@@ -1204,9 +1333,10 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   }
 
   void _scheduleSave() {
+    _lastLocalEditTime = DateTime.now();
     _isSavedNotifier.value = false;
     _debounceTimer?.cancel();
-    _debounceTimer = Timer(const Duration(milliseconds: 1000), _saveNote);
+    _debounceTimer = Timer(const Duration(milliseconds: 350), _saveNote);
   }
 
   Future<void> _saveNote() async {
@@ -1237,6 +1367,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         'updated_at': DateTime.now().toIso8601String(),
       });
       _isSavedNotifier.value = true;
+      widget.onBroadcastSync?.call();
     } catch (_) {
     } finally {
       _isSavingNotifier.value = false;
@@ -1298,6 +1429,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         ChangeSource.local,
       );
       _onContentChanged();
+      _saveNote();
     }
   }
 

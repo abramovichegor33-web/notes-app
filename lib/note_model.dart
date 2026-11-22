@@ -33,14 +33,14 @@ class Note {
     );
   }
 
-  factory Note.fromMap(Map<String, dynamic> map) {
+  factory Note.fromMap(Map<dynamic, dynamic> map) {
     return Note(
-      id: map['id'] as String,
-      vaultId: map['vault_id'] as String? ?? '',
-      title: map['title'] as String? ?? '',
-      content: map['content'] as String? ?? '',
-      plainText: map['plain_text'] as String? ?? '',
-      updatedAt: DateTime.tryParse(map['updated_at'] as String? ?? '') ??
+      id: (map['id'] ?? '').toString(),
+      vaultId: (map['vault_id'] ?? '').toString(),
+      title: (map['title'] ?? '').toString(),
+      content: (map['content'] ?? '').toString(),
+      plainText: (map['plain_text'] ?? '').toString(),
+      updatedAt: DateTime.tryParse((map['updated_at'] ?? '').toString()) ??
           DateTime.now(),
     );
   }

@@ -91,4 +91,67 @@ void main() {
     expect(find.text('Image Note'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('NoteEditorView updates text and title when remote changes arrive',
+      (WidgetTester tester) async {
+    final noteInitial = Note(
+      id: 'sync-test-note',
+      vaultId: 'TEST-123',
+      title: 'Initial Title',
+      plainText: 'Initial text',
+      content: jsonEncode([
+        {'insert': 'Initial text\n'}
+      ]),
+      updatedAt: DateTime.now(),
+    );
+
+    final noteUpdated = Note(
+      id: 'sync-test-note',
+      vaultId: 'TEST-123',
+      title: 'Synced from Phone',
+      plainText: 'Hello from Android!',
+      content: jsonEncode([
+        {'insert': 'Hello from Android!\n'}
+      ]),
+      updatedAt: DateTime.now().add(const Duration(seconds: 1)),
+    );
+
+    final currentNote = ValueNotifier<Note>(noteInitial);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        localizationsDelegates: const [
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+          FlutterQuillLocalizations.delegate,
+        ],
+        supportedLocales: const [
+          Locale('en', 'US'),
+          Locale('ru', 'RU'),
+        ],
+        home: Scaffold(
+          body: ValueListenableBuilder<Note>(
+            valueListenable: currentNote,
+            builder: (context, note, _) => NoteEditorView(
+              key: ValueKey(note.id),
+              note: note,
+              vaultId: 'TEST-123',
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.pump();
+    expect(find.text('Initial Title'), findsOneWidget);
+
+    // Simulate remote update arriving from phone
+    currentNote.value = noteUpdated;
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    expect(find.text('Synced from Phone'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }
