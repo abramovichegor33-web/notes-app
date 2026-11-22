@@ -970,6 +970,20 @@ class NoteEditorPage extends StatelessWidget {
   }
 }
 
+class AppImageCache {
+  static final Map<String, Uint8List> _cache = {};
+
+  static void put(String url, Uint8List bytes) {
+    if (_cache.length > 80) {
+      _cache.remove(_cache.keys.first);
+    }
+    _cache[url] = bytes;
+  }
+
+  static Uint8List? get(String url) => _cache[url];
+  static bool has(String url) => _cache.containsKey(url);
+}
+
 class AppImageEmbedBuilder extends EmbedBuilder {
   const AppImageEmbedBuilder();
 
@@ -1243,13 +1257,21 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
     final imageSource = widget.embedContext.node.value.data.toString();
 
     Widget imageWidget;
-    if (imageSource.startsWith('data:image/') ||
+    final cachedBytes = AppImageCache.get(imageSource);
+    if (cachedBytes != null) {
+      imageWidget = Image.memory(
+        cachedBytes,
+        fit: BoxFit.contain,
+      );
+    } else if (imageSource.startsWith('data:image/') ||
         imageSource.contains('base64')) {
       final base64String =
           imageSource.contains(',') ? imageSource.split(',')[1] : imageSource;
       try {
+        final decoded = base64Decode(base64String);
+        AppImageCache.put(imageSource, decoded);
         imageWidget = Image.memory(
-          base64Decode(base64String),
+          decoded,
           fit: BoxFit.contain,
         );
       } catch (_) {
@@ -1259,8 +1281,10 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
       imageWidget = Image.network(
         imageSource,
         fit: BoxFit.contain,
-        loadingBuilder: (context, child, loadingProgress) {
-          if (loadingProgress == null) return child;
+        frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+          if (wasSynchronouslyLoaded || frame != null) {
+            return child;
+          }
           return Container(
             height: 160,
             width: 220,
@@ -1456,7 +1480,10 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
     final controllerConfig = QuillControllerConfig(
       clipboardConfig: QuillClipboardConfig(
-        onImagePaste: _uploadImageToStorage,
+        onImagePaste: (bytes) async {
+          await _insertImageBytes(bytes);
+          return null; // Предотвращаем дублирование вставки библиотекой
+        },
       ),
     );
 
@@ -1687,6 +1714,8 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     }
   }
 
+  bool _isInsertingImage = false;
+
   void _replaceImageSourceInDocument(String oldSource, String newSource) {
     final jsonList = _quillController.document.toDelta().toJson();
     bool found = false;
@@ -1700,6 +1729,10 @@ class _NoteEditorViewState extends State<NoteEditorView> {
       }
     }
     if (found) {
+      final newContent = jsonEncode(jsonList);
+      _lastSavedContent = newContent;
+      _lastLocalEditTime = DateTime.now();
+
       final oldSelection = _quillController.selection;
       _docChangeSub?.pause();
       _quillController.document = Document.fromJson(jsonList);
@@ -1715,42 +1748,54 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   }
 
   Future<void> _insertImageBytes(Uint8List bytes) async {
-    final index = _quillController.selection.baseOffset;
-    final length = _quillController.selection.extentOffset - index;
-    final safeIndex =
-        index < 0 ? _quillController.document.length - 1 : index;
-    final safeLength = length < 0 ? 0 : length;
+    if (_isInsertingImage) return;
+    _isInsertingImage = true;
 
-    // 1. МГНОВЕННОЕ локальное превью (0 мс задержки!)
-    final isJpeg = bytes.length > 2 && bytes[0] == 0xFF && bytes[1] == 0xD8;
-    final mime = isJpeg ? 'image/jpeg' : 'image/png';
-    final tempBase64 = base64Encode(bytes);
-    final localDataUrl = 'data:$mime;base64,$tempBase64';
-
-    _quillController.replaceText(
-      safeIndex,
-      safeLength,
-      BlockEmbed.image(localDataUrl),
-      null,
-    );
-    _quillController.updateSelection(
-      TextSelection.collapsed(offset: safeIndex + 1),
-      ChangeSource.local,
-    );
-    _onContentChanged();
-
-    // 2. Фоновая оптимизированная загрузка в Supabase Storage
-    _isSavingNotifier.value = true;
     try {
-      final cloudUrl = await _uploadImageToStorage(bytes);
-      if (cloudUrl != null && mounted) {
-        // Подменяем локальный base64 постоянным облачным URL
-        _replaceImageSourceInDocument(localDataUrl, cloudUrl);
-        _saveNote();
+      final index = _quillController.selection.baseOffset;
+      final length = _quillController.selection.extentOffset - index;
+      final safeIndex =
+          index < 0 ? _quillController.document.length - 1 : index;
+      final safeLength = length < 0 ? 0 : length;
+
+      // 1. МГНОВЕННОЕ локальное превью (0 мс задержки!)
+      final isJpeg = bytes.length > 2 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+      final mime = isJpeg ? 'image/jpeg' : 'image/png';
+      final tempBase64 = base64Encode(bytes);
+      final localDataUrl = 'data:$mime;base64,$tempBase64';
+
+      // Сохраняем байты в кэш для мгновенного плавного рендера
+      AppImageCache.put(localDataUrl, bytes);
+
+      _quillController.replaceText(
+        safeIndex,
+        safeLength,
+        BlockEmbed.image(localDataUrl),
+        null,
+      );
+      _quillController.updateSelection(
+        TextSelection.collapsed(offset: safeIndex + 1),
+        ChangeSource.local,
+      );
+      _onContentChanged();
+
+      // 2. Фоновая оптимизированная загрузка в Supabase Storage
+      _isSavingNotifier.value = true;
+      try {
+        final cloudUrl = await _uploadImageToStorage(bytes);
+        if (cloudUrl != null && mounted) {
+          // Кэшируем байты по cloudUrl ДО подмены в документе, чтобы не было мерцания
+          AppImageCache.put(cloudUrl, bytes);
+          // Подменяем локальный base64 постоянным облачным URL
+          _replaceImageSourceInDocument(localDataUrl, cloudUrl);
+          _saveNote();
+        }
+      } catch (_) {
+      } finally {
+        if (mounted) _isSavingNotifier.value = false;
       }
-    } catch (_) {
     } finally {
-      if (mounted) _isSavingNotifier.value = false;
+      _isInsertingImage = false;
     }
   }
 

@@ -47,6 +47,7 @@
         if (item.type && item.type.indexOf('image') !== -1) {
           var blob = item.getAsFile();
           if (blob) {
+            e.preventDefault();
             var reader = new FileReader();
             reader.onload = function(evt) {
               window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: evt.target.result }));

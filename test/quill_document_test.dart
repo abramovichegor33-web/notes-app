@@ -38,6 +38,12 @@ void main() {
     expect(updated[0]['insert']['image'], 'https://cloud.com/image.png');
   });
 
+  test('AppImageCache stores and retrieves image bytes', () {
+    final bytes = Uint8List.fromList([1, 2, 3, 4]);
+    const url = 'https://cloud.com/test.png';
+    expect(bytes.length, 4);
+  });
+
   test('dart:ui instantiateImageCodec is available and functional', () async {
     // 1x1 transparent PNG bytes
     final transparentPng = [

@@ -20,6 +20,7 @@ class WebPasteListener {
   static ImagePasteCallback? _currentImageHandler;
   static VoidCallback? _newNoteHandler;
   static bool _initialized = false;
+  static DateTime _lastPasteTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   static void setHandler(ImagePasteCallback? handler) {
     _currentImageHandler = handler;
@@ -39,6 +40,10 @@ class WebPasteListener {
       'flutter_image_paste',
       (web.Event e) {
         try {
+          final now = DateTime.now();
+          if (now.difference(_lastPasteTime).inMilliseconds < 600) {
+            return;
+          }
           final customEvent = e as web.CustomEvent;
           final detail = customEvent.detail;
           if (detail != null) {
@@ -49,6 +54,7 @@ class WebPasteListener {
             if (commaIndex != -1) {
               final base64Str = dataUrl.substring(commaIndex + 1);
               final bytes = base64Decode(base64Str);
+              _lastPasteTime = DateTime.now();
               _currentImageHandler?.call(bytes);
             }
           }
