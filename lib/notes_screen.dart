@@ -6,6 +6,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_quill/flutter_quill.dart';
+import 'package:http/http.dart' as http;
+import 'package:pasteboard/pasteboard.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'note_model.dart';
@@ -703,6 +705,90 @@ class _NoteCardItem extends StatefulWidget {
 class _NoteCardItemState extends State<_NoteCardItem> {
   bool _isHovered = false;
 
+  void _copyNote() {
+    final t = widget.note.title.trim();
+    final p = widget.note.plainText.trim();
+    final text = t.isEmpty ? p : '$t\n\n$p';
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Row(
+          children: [
+            Icon(Icons.check_circle, color: Colors.white, size: 18),
+            SizedBox(width: 8),
+            Text('Заметка скопирована в буфер обмена'),
+          ],
+        ),
+        backgroundColor: Colors.green.shade700,
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _showCardContextMenu(TapDownDetails details) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+
+    final position = details.globalPosition;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        overlay.size.width - position.dx,
+        overlay.size.height - position.dy,
+      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      color: isDark ? const Color(0xFF222228) : Colors.white,
+      items: [
+        const PopupMenuItem<String>(
+          value: 'copy',
+          height: 38,
+          child: Row(
+            children: [
+              Icon(Icons.copy_rounded, size: 18),
+              SizedBox(width: 10),
+              Text('Скопировать текст',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(height: 1),
+        PopupMenuItem<String>(
+          value: 'delete',
+          height: 38,
+          child: Row(
+            children: [
+              Icon(Icons.delete_outline_rounded,
+                  size: 18, color: Colors.red.shade400),
+              const SizedBox(width: 10),
+              Text(
+                'Удалить заметку',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: Colors.red.shade400,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+
+    if (!mounted) return;
+
+    if (selected == 'copy') {
+      _copyNote();
+    } else if (selected == 'delete') {
+      widget.onDelete();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -734,6 +820,7 @@ class _NoteCardItemState extends State<_NoteCardItem> {
       onExit: (_) => setState(() => _isHovered = false),
       child: GestureDetector(
         onTap: widget.onTap,
+        onSecondaryTapDown: _showCardContextMenu,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 140),
           margin: const EdgeInsets.symmetric(vertical: 3),
@@ -766,7 +853,22 @@ class _NoteCardItemState extends State<_NoteCardItem> {
                       ),
                     ),
                   ),
-                  if (_isHovered || widget.isSelected)
+                  if (_isHovered || widget.isSelected) ...[
+                    InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: _copyNote,
+                      child: Padding(
+                        padding: const EdgeInsets.all(2),
+                        child: Icon(
+                          Icons.copy_rounded,
+                          size: 15,
+                          color: widget.isDark
+                              ? Colors.white60
+                              : Colors.black45,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
                     InkWell(
                       borderRadius: BorderRadius.circular(6),
                       onTap: widget.onDelete,
@@ -779,6 +881,7 @@ class _NoteCardItemState extends State<_NoteCardItem> {
                         ),
                       ),
                     ),
+                  ],
                 ],
               ),
               const SizedBox(height: 4),
@@ -908,7 +1011,61 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
     );
   }
 
-  void _showLightbox(Widget imageWidget) {
+  Future<void> _handleCopyImage(String imageSource) async {
+    try {
+      Uint8List? bytes;
+      if (imageSource.startsWith('data:image/') ||
+          imageSource.contains('base64')) {
+        final base64String =
+            imageSource.contains(',') ? imageSource.split(',')[1] : imageSource;
+        bytes = base64Decode(base64String);
+      } else if (imageSource.startsWith('http://') ||
+          imageSource.startsWith('https://')) {
+        final res = await http.get(Uri.parse(imageSource));
+        if (res.statusCode == 200) {
+          bytes = res.bodyBytes;
+        }
+      }
+
+      if (bytes != null && bytes.isNotEmpty) {
+        final base64Str = base64Encode(bytes);
+        copyImageViaNativeBridge(base64Str);
+        await Pasteboard.writeImage(bytes);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Row(
+                children: [
+                  Icon(Icons.check_circle, color: Colors.white, size: 18),
+                  SizedBox(width: 8),
+                  Text('Изображение скопировано в буфер обмена'),
+                ],
+              ),
+              backgroundColor: Colors.green.shade700,
+              behavior: SnackBarBehavior.floating,
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+        return;
+      }
+    } catch (e) {
+      debugPrint('Error copying image: $e');
+    }
+
+    Clipboard.setData(ClipboardData(text: imageSource));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Ссылка на изображение скопирована'),
+          behavior: SnackBarBehavior.floating,
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  void _showLightbox(Widget imageWidget, String imageSource) {
     showDialog(
       context: context,
       builder: (dialogCtx) => Dialog(
@@ -931,6 +1088,19 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Colors.black.withAlpha(160),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: IconButton(
+                      icon: const Icon(Icons.copy_rounded,
+                          color: Colors.white, size: 20),
+                      tooltip: 'Скопировать изображение',
+                      onPressed: () => _handleCopyImage(imageSource),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
                   Container(
                     decoration: BoxDecoration(
                       color: Colors.red.withAlpha(200),
@@ -989,6 +1159,31 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
       color: isDark ? const Color(0xFF222228) : Colors.white,
       items: [
         const PopupMenuItem<String>(
+          value: 'copy_image',
+          height: 38,
+          child: Row(
+            children: [
+              Icon(Icons.copy_rounded, size: 18),
+              SizedBox(width: 10),
+              Text(
+                'Скопировать изображение',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
+        ),
+        const PopupMenuItem<String>(
+          value: 'copy_link',
+          height: 38,
+          child: Row(
+            children: [
+              Icon(Icons.link_rounded, size: 18),
+              SizedBox(width: 10),
+              Text('Скопировать ссылку', style: TextStyle(fontSize: 13)),
+            ],
+          ),
+        ),
+        const PopupMenuItem<String>(
           value: 'view',
           height: 38,
           child: Row(
@@ -996,17 +1191,6 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
               Icon(Icons.fullscreen_rounded, size: 18),
               SizedBox(width: 10),
               Text('Открыть на весь экран', style: TextStyle(fontSize: 13)),
-            ],
-          ),
-        ),
-        const PopupMenuItem<String>(
-          value: 'copy',
-          height: 38,
-          child: Row(
-            children: [
-              Icon(Icons.copy_rounded, size: 18),
-              SizedBox(width: 10),
-              Text('Скопировать ссылку', style: TextStyle(fontSize: 13)),
             ],
           ),
         ),
@@ -1035,18 +1219,21 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
 
     if (!mounted) return;
 
-    if (selected == 'delete') {
-      _deleteImage();
-    } else if (selected == 'copy') {
+    if (selected == 'copy_image') {
+      _handleCopyImage(imageSource);
+    } else if (selected == 'copy_link') {
       Clipboard.setData(ClipboardData(text: imageSource));
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Ссылка скопирована в буфер обмена'),
+          behavior: SnackBarBehavior.floating,
           duration: Duration(seconds: 2),
         ),
       );
+    } else if (selected == 'delete') {
+      _deleteImage();
     } else if (selected == 'view') {
-      _showLightbox(imageWidget);
+      _showLightbox(imageWidget, imageSource);
     }
   }
 
@@ -1119,7 +1306,7 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8.0),
       child: GestureDetector(
-        onTap: () => _showLightbox(imageWidget),
+        onTap: () => _showLightbox(imageWidget, imageSource),
         onSecondaryTapDown: (details) =>
             _showContextMenu(details, imageSource, imageWidget),
         child: MouseRegion(
@@ -1153,23 +1340,66 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
                       top: 8,
                       right: 8,
                       child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 4, vertical: 2),
                         decoration: BoxDecoration(
-                          color: Colors.black.withAlpha(180),
+                          color: Colors.black.withAlpha(200),
                           borderRadius: BorderRadius.circular(8),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Colors.black26,
+                              blurRadius: 4,
+                              offset: Offset(0, 2),
+                            ),
+                          ],
                         ),
-                        child: IconButton(
-                          icon: const Icon(
-                            Icons.delete_outline_rounded,
-                            size: 19,
-                            color: Colors.white,
-                          ),
-                          tooltip: 'Удалить изображение (ПКМ)',
-                          constraints: const BoxConstraints(
-                            minWidth: 32,
-                            minHeight: 32,
-                          ),
-                          padding: const EdgeInsets.all(6),
-                          onPressed: _deleteImage,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              icon: const Icon(
+                                Icons.copy_rounded,
+                                size: 18,
+                                color: Colors.white,
+                              ),
+                              tooltip: 'Скопировать изображение',
+                              constraints: const BoxConstraints(
+                                minWidth: 32,
+                                minHeight: 32,
+                              ),
+                              padding: const EdgeInsets.all(6),
+                              onPressed: () => _handleCopyImage(imageSource),
+                            ),
+                            IconButton(
+                              icon: const Icon(
+                                Icons.fullscreen_rounded,
+                                size: 20,
+                                color: Colors.white,
+                              ),
+                              tooltip: 'Открыть на весь экран',
+                              constraints: const BoxConstraints(
+                                minWidth: 32,
+                                minHeight: 32,
+                              ),
+                              padding: const EdgeInsets.all(6),
+                              onPressed: () =>
+                                  _showLightbox(imageWidget, imageSource),
+                            ),
+                            IconButton(
+                              icon: Icon(
+                                Icons.delete_outline_rounded,
+                                size: 19,
+                                color: Colors.red.shade300,
+                              ),
+                              tooltip: 'Удалить изображение',
+                              constraints: const BoxConstraints(
+                                minWidth: 32,
+                                minHeight: 32,
+                              ),
+                              padding: const EdgeInsets.all(6),
+                              onPressed: _deleteImage,
+                            ),
+                          ],
                         ),
                       ),
                     ),
@@ -1445,6 +1675,28 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     } catch (_) {}
   }
 
+  void _copyNoteContent() {
+    final title = _titleController.text.trim();
+    final plainText = _quillController.document.toPlainText().trim();
+    final fullText = title.isEmpty ? plainText : '$title\n\n$plainText';
+
+    Clipboard.setData(ClipboardData(text: fullText));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Row(
+          children: [
+            Icon(Icons.check_circle, color: Colors.white, size: 18),
+            SizedBox(width: 8),
+            Text('Текст заметки скопирован в буфер обмена'),
+          ],
+        ),
+        backgroundColor: Colors.green.shade700,
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
@@ -1531,7 +1783,14 @@ class _NoteEditorViewState extends State<NoteEditorView> {
                   );
                 },
               ),
-              const SizedBox(width: 16),
+              const SizedBox(width: 12),
+
+              // Кнопка копирования всей заметки
+              IconButton(
+                icon: const Icon(Icons.copy_rounded, size: 20),
+                tooltip: 'Скопировать весь текст заметки',
+                onPressed: _copyNoteContent,
+              ),
 
               // Кнопка вставки картинки
               IconButton(

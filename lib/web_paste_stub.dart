@@ -6,3 +6,5 @@ class WebPasteListener {
   static void setHandler(ImagePasteCallback? handler) {}
   static void setNewNoteHandler(VoidCallback? handler) {}
 }
+
+bool copyImageViaNativeBridge(String base64Data) => false;

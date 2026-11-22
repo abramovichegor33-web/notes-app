@@ -21,6 +21,24 @@
 </head>
 <body>
   <script>
+    // Блокируем стандартное контекстное меню браузера, чтобы отображалось только наше меню Flutter
+    window.addEventListener('contextmenu', function(e) {
+      e.preventDefault();
+    }, true);
+
+    // Мост для прямого копирования картинок в системный буфер обмена macOS (NSPasteboard)
+    window.copyImageToClipboard = function(base64Data) {
+      try {
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.copyImageToClipboard) {
+          window.webkit.messageHandlers.copyImageToClipboard.postMessage(base64Data);
+          return true;
+        }
+      } catch (err) {
+        console.error('copyImageToClipboard error:', err);
+      }
+      return false;
+    };
+
     window.addEventListener('paste', function(e) {
       if (!e.clipboardData || !e.clipboardData.items) return;
       var items = e.clipboardData.items;

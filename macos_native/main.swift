@@ -104,10 +104,31 @@ final class StaticFileServer {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class CustomWebView: WKWebView {
+    override func menu(for event: NSEvent) -> NSMenu? {
+        return nil
+    }
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        menu.removeAllItems()
+    }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
     var window: NSWindow!
-    var webView: WKWebView!
+    var webView: CustomWebView!
     var server: StaticFileServer?
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "copyImageToClipboard", let base64String = message.body as? String {
+            let cleanBase64 = base64String.contains(",") ? String(base64String.split(separator: ",")[1]) : base64String
+            if let data = Data(base64Encoded: cleanBase64), let image = NSImage(data: data) {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.writeObjects([image])
+            }
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMainMenu()
@@ -135,8 +156,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
+        let contentController = WKUserContentController()
+        contentController.add(self, name: "copyImageToClipboard")
+        config.userContentController = contentController
 
-        webView = WKWebView(frame: window.contentView!.bounds, configuration: config)
+        webView = CustomWebView(frame: window.contentView!.bounds, configuration: config)
         webView.autoresizingMask = [.width, .height]
         window.contentView?.addSubview(webView)
 

@@ -5,6 +5,17 @@ import 'package:web/web.dart' as web;
 
 typedef ImagePasteCallback = void Function(Uint8List bytes);
 
+@JS('copyImageToClipboard')
+external JSBoolean? _copyImageToClipboardJS(JSString data);
+
+bool copyImageViaNativeBridge(String base64Data) {
+  try {
+    return _copyImageToClipboardJS(base64Data.toJS)?.toDart ?? false;
+  } catch (_) {
+    return false;
+  }
+}
+
 class WebPasteListener {
   static ImagePasteCallback? _currentImageHandler;
   static VoidCallback? _newNoteHandler;

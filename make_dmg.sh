@@ -10,6 +10,7 @@ rm -rf "$BUILD_DIR" "$DMG_PATH"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
+swiftc -O -target arm64-apple-macos11.0 macos_native/main.swift -o macos_native/Notes
 cp macos_native/Notes "$APP_DIR/Contents/MacOS/Notes"
 chmod +x "$APP_DIR/Contents/MacOS/Notes"
 
