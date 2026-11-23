@@ -71,7 +71,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
 
   void _startPeriodicSync() {
     _periodicSyncTimer?.cancel();
-    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       _syncFromCloudSilently();
     });
   }
@@ -108,8 +108,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
         for (int i = 0; i < cloudNotes.length; i++) {
           if (cloudNotes[i].id != _notes[i].id ||
               cloudNotes[i].title != _notes[i].title ||
-              cloudNotes[i].content != _notes[i].content ||
-              cloudNotes[i].updatedAt != _notes[i].updatedAt) {
+              cloudNotes[i].content != _notes[i].content) {
             hasChanges = true;
             break;
           }
@@ -123,9 +122,13 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
         if (_selectedNote != null) {
           final match = _notes.where((n) => n.id == _selectedNote!.id);
           if (match.isNotEmpty) {
-            setState(() {
-              _selectedNote = match.first;
-            });
+            final remoteNote = match.first;
+            if (remoteNote.title != _selectedNote!.title ||
+                remoteNote.content != _selectedNote!.content) {
+              setState(() {
+                _selectedNote = remoteNote;
+              });
+            }
           } else {
             setState(() {
               _selectedNote = _notes.isNotEmpty ? _notes.first : null;
@@ -238,42 +241,57 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _createNewNote() async {
-    final newNote = Note(
-      id: _generateUuid(),
-      vaultId: widget.vaultId,
-      title: 'Новая заметка',
-      content: jsonEncode([
-        {'insert': '\n'}
-      ]),
-      plainText: '',
-      updatedAt: DateTime.now(),
-    );
+  bool _isCreatingNote = false;
+  DateTime _lastCreateNoteTime = DateTime.fromMillisecondsSinceEpoch(0);
 
-    _notes.insert(0, newNote);
-    _notesNotifier.value = List.of(_notes);
-    setState(() {
-      _selectedNote = newNote;
-    });
+  Future<void> _createNewNote() async {
+    final now = DateTime.now();
+    if (_isCreatingNote ||
+        now.difference(_lastCreateNoteTime).inMilliseconds < 600) {
+      return;
+    }
+    _isCreatingNote = true;
+    _lastCreateNoteTime = now;
 
     try {
-      await Supabase.instance.client.from('notes').insert(newNote.toMap());
-      _broadcastSync();
-    } catch (_) {}
-
-    if (mounted && MediaQuery.of(context).size.width < 720) {
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => NoteEditorPage(
-            initialNote: newNote,
-            vaultId: widget.vaultId,
-            notesNotifier: _notesNotifier,
-            onNoteUpdated: _onNoteLocallyUpdated,
-            onNoteDeleted: _deleteNote,
-            onBroadcastSync: _broadcastSync,
-          ),
-        ),
+      final newNote = Note(
+        id: _generateUuid(),
+        vaultId: widget.vaultId,
+        title: 'Новая заметка',
+        content: jsonEncode([
+          {'insert': '\n'}
+        ]),
+        plainText: '',
+        updatedAt: DateTime.now(),
       );
+
+      _notes.insert(0, newNote);
+      _notesNotifier.value = List.of(_notes);
+      setState(() {
+        _selectedNote = newNote;
+      });
+
+      try {
+        await Supabase.instance.client.from('notes').insert(newNote.toMap());
+        _broadcastSync();
+      } catch (_) {}
+
+      if (mounted && MediaQuery.of(context).size.width < 720) {
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => NoteEditorPage(
+              initialNote: newNote,
+              vaultId: widget.vaultId,
+              notesNotifier: _notesNotifier,
+              onNoteUpdated: _onNoteLocallyUpdated,
+              onNoteDeleted: _deleteNote,
+              onBroadcastSync: _broadcastSync,
+            ),
+          ),
+        );
+      }
+    } finally {
+      _isCreatingNote = false;
     }
   }
 
@@ -1550,13 +1568,22 @@ class _NoteEditorViewState extends State<NoteEditorView> {
       final bool contentChanged = remoteContent != _lastSavedContent;
 
       if (titleChanged || contentChanged) {
+        final hasPendingLocalChanges =
+            _isSavingNotifier.value || (_debounceTimer?.isActive ?? false);
         final msSinceLocalEdit =
             DateTime.now().difference(_lastLocalEditTime).inMilliseconds;
-        // Применяем изменения из облака, если пользователь не печатает прямо в эту секунду
-        if (msSinceLocalEdit > 350) {
-          _lastSavedTitle = remoteTitle;
-          _lastSavedContent = remoteContent;
-          _isSavedNotifier.value = true;
+
+        // Защита активной заметки: если вставляется картинка, есть несохраненные правки
+        // или пользователь печатал в последние 2 секунды — не перезаписываем редактор!
+        if (_isInsertingImage ||
+            hasPendingLocalChanges ||
+            msSinceLocalEdit < 2000) {
+          return;
+        }
+
+        _lastSavedTitle = remoteTitle;
+        _lastSavedContent = remoteContent;
+        _isSavedNotifier.value = true;
 
           if (titleChanged) {
             _titleController.text = remoteTitle;
@@ -1580,7 +1607,6 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         }
       }
     }
-  }
 
   void _onTitleChanged() {
     _scheduleSave();
@@ -1600,6 +1626,11 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   Future<void> _saveNote() async {
     final title = _titleController.text.trim();
     final content = jsonEncode(_quillController.document.toDelta().toJson());
+
+    // Защита: никогда не сохраняем временные data:image base64 строки в базу данных
+    if (content.contains('data:image/')) {
+      return;
+    }
 
     if (title == _lastSavedTitle && content == _lastSavedContent) {
       _isSavedNotifier.value = true;
@@ -1715,6 +1746,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   }
 
   bool _isInsertingImage = false;
+  DateTime _lastImageInsertTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   void _replaceImageSourceInDocument(String oldSource, String newSource) {
     final jsonList = _quillController.document.toDelta().toJson();
@@ -1748,8 +1780,13 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   }
 
   Future<void> _insertImageBytes(Uint8List bytes) async {
-    if (_isInsertingImage) return;
+    final now = DateTime.now();
+    if (_isInsertingImage ||
+        now.difference(_lastImageInsertTime).inMilliseconds < 600) {
+      return;
+    }
     _isInsertingImage = true;
+    _lastImageInsertTime = now;
 
     try {
       final index = _quillController.selection.baseOffset;
@@ -1777,10 +1814,14 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         TextSelection.collapsed(offset: safeIndex + 1),
         ChangeSource.local,
       );
-      _onContentChanged();
+
+      // Отменяем таймер сохранения, чтобы временный Base64 НЕ улетал в базу данных!
+      _debounceTimer?.cancel();
+      _lastLocalEditTime = DateTime.now();
+      _isSavedNotifier.value = false;
+      _isSavingNotifier.value = true;
 
       // 2. Фоновая оптимизированная загрузка в Supabase Storage
-      _isSavingNotifier.value = true;
       try {
         final cloudUrl = await _uploadImageToStorage(bytes);
         if (cloudUrl != null && mounted) {
@@ -1790,7 +1831,8 @@ class _NoteEditorViewState extends State<NoteEditorView> {
           _replaceImageSourceInDocument(localDataUrl, cloudUrl);
           _saveNote();
         }
-      } catch (_) {
+      } catch (e) {
+        debugPrint('Image upload error: $e');
       } finally {
         if (mounted) _isSavingNotifier.value = false;
       }

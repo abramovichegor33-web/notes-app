@@ -182,9 +182,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
         return true
     }
 
+    private var lastPasteTime: TimeInterval = 0
+    private var lastNewNoteTime: TimeInterval = 0
+
     @objc func pasteAction(_ sender: Any?) {
+        let now = Date().timeIntervalSince1970
+        if now - lastPasteTime < 0.5 {
+            return
+        }
+        lastPasteTime = now
+
         let pb = NSPasteboard.general
+        var targetImage: NSImage? = nil
+
         if let images = pb.readObjects(forClasses: [NSImage.self], options: nil), let image = images.first as? NSImage {
+            targetImage = image
+        } else if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], let url = urls.first {
+            let ext = url.pathExtension.lowercased()
+            if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "heic"].contains(ext) {
+                targetImage = NSImage(contentsOf: url)
+            }
+        }
+
+        if let image = targetImage {
             if let tiff = image.tiffRepresentation,
                let bitmap = NSBitmapImageRep(data: tiff) {
                 var rep = bitmap
@@ -236,6 +256,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
     }
 
     @objc func newNoteAction(_ sender: Any?) {
+        let now = Date().timeIntervalSince1970
+        if now - lastNewNoteTime < 0.5 {
+            return
+        }
+        lastNewNoteTime = now
         let js = "window.dispatchEvent(new CustomEvent('flutter_new_note'));"
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
