@@ -55,18 +55,18 @@ class _NotesAppState extends State<NotesApp> {
 
     final darkTheme = ThemeData(
       brightness: Brightness.dark,
-      scaffoldBackgroundColor: const Color(0xFF0F1012), // Soft Obsidian
-      canvasColor: const Color(0xFF0F1012),
-      cardColor: const Color(0xFF1E2025),
+      scaffoldBackgroundColor: const Color(0xFF0D0E10), // Base dark canvas
+      canvasColor: const Color(0xFF0D0E10),
+      cardColor: const Color(0xFF141518), // Floating editor card sheet
       colorScheme: const ColorScheme.dark(
         primary: accentColor,
-        surface: Color(0xFF141518), // Sidebar background
+        surface: Color(0xFF121316), // Sidebar background
         onSurface: Color(0xFFEDEDEF), // Primary text
         onSurfaceVariant: Color(0xFF7E828C), // Secondary text
-        surfaceContainerHighest: Color(0xFF1E2025), // Active note
-        outlineVariant: Color(0xFF22242A), // Subtle separator
+        surfaceContainerHighest: Color(0xFF1E2026), // Active note card
+        outlineVariant: Color(0x14FFFFFF), // Hairline border (rgba(255,255,255,0.08))
       ),
-      dividerColor: const Color(0xFF22242A),
+      dividerColor: const Color(0x0FFFFFFF), // Hairline separator (rgba(255,255,255,0.06))
       textSelectionTheme: const TextSelectionThemeData(
         cursorColor: accentColor,
         selectionColor: Color(0x406366F1),
@@ -83,18 +83,18 @@ class _NotesAppState extends State<NotesApp> {
 
     final lightTheme = ThemeData(
       brightness: Brightness.light,
-      scaffoldBackgroundColor: const Color(0xFFFAFAFB), // Soft Paper
-      canvasColor: const Color(0xFFFAFAFB),
-      cardColor: const Color(0xFFFFFFFF),
+      scaffoldBackgroundColor: const Color(0xFFF0F1F4), // Base light canvas
+      canvasColor: const Color(0xFFF0F1F4),
+      cardColor: const Color(0xFFFFFFFF), // Floating editor card sheet
       colorScheme: const ColorScheme.light(
         primary: accentColor,
-        surface: Color(0xFFF2F3F5), // Sidebar background
+        surface: Color(0xFFF6F7F9), // Sidebar background
         onSurface: Color(0xFF1A1B1E), // Primary text
         onSurfaceVariant: Color(0xFF6E737D), // Secondary text
-        surfaceContainerHighest: Color(0xFFFFFFFF), // Active note
-        outlineVariant: Color(0xFFE5E7EB), // Subtle separator
+        surfaceContainerHighest: Color(0xFFFFFFFF), // Active note card
+        outlineVariant: Color(0x12000000), // Hairline border (rgba(0,0,0,0.07))
       ),
-      dividerColor: const Color(0xFFE5E7EB),
+      dividerColor: const Color(0x0F000000), // Hairline separator (rgba(0,0,0,0.06))
       textSelectionTheme: const TextSelectionThemeData(
         cursorColor: accentColor,
         selectionColor: Color(0x336366F1),

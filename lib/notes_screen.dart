@@ -34,6 +34,7 @@ class NotesScreen extends StatefulWidget {
 class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   final _searchController = TextEditingController();
   final _searchFocusNode = FocusNode();
+  bool _isSearchHovered = false;
 
   final ValueNotifier<List<Note>> _notesNotifier =
       ValueNotifier<List<Note>>([]);
@@ -50,11 +51,16 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _searchFocusNode.addListener(_onSearchFocusChange);
     WebPasteListener.setNewNoteHandler(_createNewNote);
     _loadPinnedNotes();
     _fetchNotes();
     _setupRealtime();
     _startPeriodicSync();
+  }
+
+  void _onSearchFocusChange() {
+    if (mounted) setState(() {});
   }
 
   Future<void> _loadPinnedNotes() async {
@@ -216,6 +222,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
     _periodicSyncTimer?.cancel();
     _incomingSyncDebounce?.cancel();
     WebPasteListener.setNewNoteHandler(null);
+    _searchFocusNode.removeListener(_onSearchFocusChange);
     _searchController.dispose();
     _searchFocusNode.dispose();
     _notesNotifier.dispose();
@@ -558,57 +565,60 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
     final isDesktop = MediaQuery.sizeOf(context).width >= 720;
 
     if (isDesktop) {
       return Scaffold(
+        backgroundColor:
+            isDark ? const Color(0xFF0D0E10) : const Color(0xFFF0F1F4),
         body: Row(
           children: [
             SizedBox(
               width: 270,
               child: _buildSidebar(),
             ),
-            VerticalDivider(
-              width: 1,
-              thickness: 1,
-              color: Theme.of(context).dividerColor.withAlpha(60),
-            ),
             Expanded(
-              child: AnimatedSwitcher(
-                duration: const Duration(milliseconds: 180),
-                switchInCurve: Curves.easeOutCubic,
-                switchOutCurve: Curves.easeInCubic,
-                transitionBuilder: (child, animation) {
-                  return FadeTransition(
-                    opacity: animation,
-                    child: SlideTransition(
-                      position: Tween<Offset>(
-                        begin: const Offset(0, 0.015),
-                        end: Offset.zero,
-                      ).animate(CurvedAnimation(
-                        parent: animation,
-                        curve: Curves.easeOutCubic,
-                      )),
-                      child: child,
-                    ),
-                  );
-                },
-                child: _selectedNote == null
-                    ? KeyedSubtree(
-                        key: const ValueKey('empty_state'),
-                        child: _buildEmptyState(),
-                      )
-                    : KeyedSubtree(
-                        key: ValueKey(_selectedNote!.id),
-                        child: NoteEditorView(
-                          note: _selectedNote!,
-                          vaultId: widget.vaultId,
-                          onNoteUpdated: _handleNoteUpdated,
-                          onDeleteRequested: () =>
-                              _deleteNote(_selectedNote!.id),
-                          onBroadcastSync: _broadcastSync,
-                        ),
+              child: Container(
+                color:
+                    isDark ? const Color(0xFF0D0E10) : const Color(0xFFF0F1F4),
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 180),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  transitionBuilder: (child, animation) {
+                    return FadeTransition(
+                      opacity: animation,
+                      child: SlideTransition(
+                        position: Tween<Offset>(
+                          begin: const Offset(0, 0.015),
+                          end: Offset.zero,
+                        ).animate(CurvedAnimation(
+                          parent: animation,
+                          curve: Curves.easeOutCubic,
+                        )),
+                        child: child,
                       ),
+                    );
+                  },
+                  child: _selectedNote == null
+                      ? KeyedSubtree(
+                          key: const ValueKey('empty_state'),
+                          child: _buildEmptyState(),
+                        )
+                      : KeyedSubtree(
+                          key: ValueKey(_selectedNote!.id),
+                          child: NoteEditorView(
+                            note: _selectedNote!,
+                            vaultId: widget.vaultId,
+                            onNoteUpdated: _handleNoteUpdated,
+                            onDeleteRequested: () =>
+                                _deleteNote(_selectedNote!.id),
+                            onBroadcastSync: _broadcastSync,
+                          ),
+                        ),
+                ),
               ),
             ),
           ],
@@ -677,50 +687,81 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
 
   Widget _buildEmptyState() {
     final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
     return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            Icons.edit_note_rounded,
-            size: 48,
-            color: theme.colorScheme.onSurfaceVariant.withAlpha(80),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 36, vertical: 32),
+        decoration: BoxDecoration(
+          color: isDark ? const Color(0xFF141518) : Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: isDark
+                ? Colors.white.withOpacity(0.08)
+                : Colors.black.withOpacity(0.07),
+            width: 1.0,
           ),
-          const SizedBox(height: 12),
-          Text(
-            'Выберите заметку или создайте новую',
-            style: TextStyle(
-              fontSize: 14,
-              color: theme.colorScheme.onSurfaceVariant,
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(isDark ? 0.35 : 0.05),
+              blurRadius: 20,
+              offset: const Offset(0, 4),
             ),
-          ),
-          const SizedBox(height: 16),
-          BouncingPressable(
-            onTap: _createNewNote,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF6366F1),
-                borderRadius: BorderRadius.circular(10),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.edit_note_rounded,
+              size: 44,
+              color: theme.colorScheme.onSurfaceVariant.withOpacity(0.6),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Выберите заметку или создайте новую',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+                color: theme.colorScheme.onSurfaceVariant,
               ),
-              child: const Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.add_rounded, size: 18, color: Colors.white),
-                  SizedBox(width: 6),
-                  Text(
-                    'Новая заметка',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
+            ),
+            const SizedBox(height: 18),
+            BouncingPressable(
+              onTap: _createNewNote,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF6366F1),
+                  borderRadius: BorderRadius.circular(10),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF6366F1).withOpacity(0.3),
+                      blurRadius: 10,
+                      offset: const Offset(0, 2),
                     ),
-                  ),
-                ],
+                  ],
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.add_rounded, size: 16, color: Colors.white),
+                    SizedBox(width: 6),
+                    Text(
+                      'Новая заметка',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -730,7 +771,17 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
     final isDark = theme.brightness == Brightness.dark;
 
     return Container(
-      color: theme.colorScheme.surface,
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF121316) : const Color(0xFFF6F7F9),
+        border: Border(
+          right: BorderSide(
+            color: isDark
+                ? Colors.white.withOpacity(0.06)
+                : Colors.black.withOpacity(0.06),
+            width: 1.0,
+          ),
+        ),
+      ),
       child: Column(
         children: [
           Padding(
@@ -744,9 +795,15 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
                         const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                     decoration: BoxDecoration(
                       color: isDark
-                          ? const Color(0xFF1F2228)
+                          ? const Color(0xFF181A1F)
                           : const Color(0xFFE5E7EB),
                       borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: isDark
+                            ? Colors.white.withOpacity(0.06)
+                            : Colors.black.withOpacity(0.06),
+                        width: 1.0,
+                      ),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -788,6 +845,13 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
                     decoration: BoxDecoration(
                       color: const Color(0xFF6366F1),
                       borderRadius: BorderRadius.circular(8),
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xFF6366F1).withOpacity(0.3),
+                          blurRadius: 8,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
                     ),
                     child: const Icon(
                       Icons.add_rounded,
@@ -801,48 +865,79 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
           ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
-            child: Container(
-              height: 36,
-              decoration: BoxDecoration(
-                color: isDark
-                    ? const Color(0xFF1B1D22)
-                    : const Color(0xFFE9EBEF),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: TextField(
-                controller: _searchController,
-                focusNode: _searchFocusNode,
-                style:
-                    TextStyle(fontSize: 13, color: theme.colorScheme.onSurface),
-                onChanged: (val) => setState(() => _searchQuery = val),
-                decoration: InputDecoration(
-                  prefixIcon: Icon(
-                    Icons.search_rounded,
-                    size: 16,
-                    color: theme.colorScheme.onSurfaceVariant,
+            child: MouseRegion(
+              onEnter: (_) => setState(() => _isSearchHovered = true),
+              onExit: (_) => setState(() => _isSearchHovered = false),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                curve: Curves.easeOutCubic,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: isDark ? const Color(0xFF16181D) : Colors.white,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: _searchFocusNode.hasFocus
+                        ? (isDark
+                            ? Colors.white.withOpacity(0.20)
+                            : Colors.black.withOpacity(0.20))
+                        : (_isSearchHovered
+                            ? (isDark
+                                ? Colors.white.withOpacity(0.12)
+                                : Colors.black.withOpacity(0.11))
+                            : (isDark
+                                ? Colors.white.withOpacity(0.06)
+                                : Colors.black.withOpacity(0.06))),
+                    width: 1.0,
                   ),
-                  prefixIconConstraints:
-                      const BoxConstraints(minWidth: 32, minHeight: 32),
-                  suffixIcon: _searchQuery.isNotEmpty
-                      ? GestureDetector(
-                          onTap: () {
-                            _searchController.clear();
-                            setState(() => _searchQuery = '');
-                          },
-                          child: Icon(
-                            Icons.close_rounded,
-                            size: 15,
-                            color: theme.colorScheme.onSurfaceVariant,
-                          ),
-                        )
+                  boxShadow: _searchFocusNode.hasFocus
+                      ? [
+                          BoxShadow(
+                            color: (isDark ? Colors.white : Colors.black)
+                                .withOpacity(0.04),
+                            blurRadius: 8,
+                            offset: const Offset(0, 2),
+                          )
+                        ]
                       : null,
-                  hintText: 'Поиск заметок... (⌘F)',
-                  hintStyle: TextStyle(
-                    fontSize: 12,
-                    color: theme.colorScheme.onSurfaceVariant.withAlpha(160),
+                ),
+                child: TextField(
+                  controller: _searchController,
+                  focusNode: _searchFocusNode,
+                  style: TextStyle(
+                      fontSize: 13, color: theme.colorScheme.onSurface),
+                  onChanged: (val) => setState(() => _searchQuery = val),
+                  decoration: InputDecoration(
+                    prefixIcon: Icon(
+                      Icons.search_rounded,
+                      size: 16,
+                      color: _searchFocusNode.hasFocus
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.onSurfaceVariant,
+                    ),
+                    prefixIconConstraints:
+                        const BoxConstraints(minWidth: 32, minHeight: 32),
+                    suffixIcon: _searchQuery.isNotEmpty
+                        ? GestureDetector(
+                            onTap: () {
+                              _searchController.clear();
+                              setState(() => _searchQuery = '');
+                            },
+                            child: Icon(
+                              Icons.close_rounded,
+                              size: 15,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          )
+                        : null,
+                    hintText: 'Поиск заметок... (⌘F)',
+                    hintStyle: TextStyle(
+                      fontSize: 12,
+                      color:
+                          theme.colorScheme.onSurfaceVariant.withOpacity(0.6),
+                    ),
+                    border: InputBorder.none,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 9),
                   ),
-                  border: InputBorder.none,
-                  contentPadding: const EdgeInsets.symmetric(vertical: 9),
                 ),
               ),
             ),
@@ -1096,33 +1191,46 @@ class _SidebarNoteCardState extends State<_SidebarNoteCard> {
         : 'Без названия';
     final preview = widget.note.plainText.trim();
 
+    final borderColor = widget.isSelected
+        ? (isDark
+            ? Colors.white.withOpacity(0.18)
+            : Colors.black.withOpacity(0.16))
+        : (_isHovered
+            ? (isDark
+                ? Colors.white.withOpacity(0.12)
+                : Colors.black.withOpacity(0.10))
+            : (isDark
+                ? Colors.white.withOpacity(0.04)
+                : Colors.black.withOpacity(0.04)));
+
+    final bgColor = widget.isSelected
+        ? (isDark ? const Color(0xFF1E2026) : Colors.white)
+        : (_isHovered
+            ? (isDark ? const Color(0xFF181A1F) : const Color(0xFFF3F4F6))
+            : Colors.transparent);
+
     return MouseRegion(
       onEnter: (_) => setState(() => _isHovered = true),
       onExit: (_) => setState(() => _isHovered = false),
       child: Padding(
-        padding: const EdgeInsets.only(bottom: 3),
+        padding: const EdgeInsets.only(bottom: 4),
         child: BouncingPressable(
           onTap: widget.onTap,
           child: AnimatedContainer(
-            duration: const Duration(milliseconds: 140),
+            duration: const Duration(milliseconds: 200),
             curve: Curves.easeOutCubic,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             decoration: BoxDecoration(
-              color: widget.isSelected
-                  ? theme.colorScheme.surfaceContainerHighest
-                  : (_isHovered
-                      ? (isDark
-                          ? const Color(0xFF1B1D22)
-                          : const Color(0xFFE9EBEF))
-                      : Colors.transparent),
-              borderRadius: BorderRadius.circular(10),
-              boxShadow: widget.isSelected && !isDark
+              color: bgColor,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: borderColor, width: 1.0),
+              boxShadow: widget.isSelected
                   ? [
                       BoxShadow(
-                        color: Colors.black.withAlpha(8),
+                        color: Colors.black.withOpacity(isDark ? 0.35 : 0.05),
                         blurRadius: 10,
                         offset: const Offset(0, 2),
-                      )
+                      ),
                     ]
                   : null,
             ),
@@ -1232,17 +1340,21 @@ class _MobileNoteCard extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         decoration: BoxDecoration(
-          color: theme.cardColor,
+          color: isDark ? const Color(0xFF141518) : Colors.white,
           borderRadius: BorderRadius.circular(14),
-          boxShadow: !isDark
-              ? [
-                  BoxShadow(
-                    color: Colors.black.withAlpha(6),
-                    blurRadius: 10,
-                    offset: const Offset(0, 2),
-                  ),
-                ]
-              : null,
+          border: Border.all(
+            color: isDark
+                ? Colors.white.withOpacity(0.08)
+                : Colors.black.withOpacity(0.07),
+            width: 1.0,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(isDark ? 0.30 : 0.05),
+              blurRadius: 10,
+              offset: const Offset(0, 2),
+            ),
+          ],
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1714,6 +1826,7 @@ class NoteEditorView extends StatefulWidget {
 class _NoteEditorViewState extends State<NoteEditorView>
     with WidgetsBindingObserver {
   late TextEditingController _titleController;
+  final FocusNode _titleFocusNode = FocusNode();
   late QuillController _quillController;
   final FocusNode _editorFocusNode = FocusNode();
   final ScrollController _editorScrollController = ScrollController();
@@ -1722,6 +1835,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
 
   bool _isInternalDocUpdate = false;
   bool _isApplyingRemoteChange = false;
+  bool _isCardHovered = false;
 
   String _lastSavedTitle = '';
   String _lastSavedContent = '';
@@ -1761,6 +1875,8 @@ class _NoteEditorViewState extends State<NoteEditorView>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _titleFocusNode.addListener(_handleFocusChange);
+    _editorFocusNode.addListener(_handleFocusChange);
     _titleController = TextEditingController(text: widget.note.title);
     _lastSavedTitle = widget.note.title;
     _lastSavedContent = widget.note.content;
@@ -2053,6 +2169,10 @@ class _NoteEditorViewState extends State<NoteEditorView>
     }
   }
 
+  void _handleFocusChange() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -2060,6 +2180,9 @@ class _NoteEditorViewState extends State<NoteEditorView>
     _debounceTimer?.cancel();
     _docChangeSub?.cancel();
     _saveNote();
+    _titleFocusNode.removeListener(_handleFocusChange);
+    _editorFocusNode.removeListener(_handleFocusChange);
+    _titleFocusNode.dispose();
     _titleController.dispose();
     _editorFocusNode.dispose();
     _editorScrollController.dispose();
@@ -2289,61 +2412,69 @@ class _NoteEditorViewState extends State<NoteEditorView>
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
 
-    return Stack(
+    final bool isEditorActive =
+        _titleFocusNode.hasFocus || _editorFocusNode.hasFocus;
+
+    final sheetBorderColor = isEditorActive
+        ? (isDark
+            ? Colors.white.withOpacity(0.18)
+            : Colors.black.withOpacity(0.18))
+        : (_isCardHovered
+            ? (isDark
+                ? Colors.white.withOpacity(0.12)
+                : Colors.black.withOpacity(0.11))
+            : (isDark
+                ? Colors.white.withOpacity(0.08)
+                : Colors.black.withOpacity(0.07)));
+
+    final Widget editorBody = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        GestureDetector(
-          onTap: () {
-            if (!_editorFocusNode.hasFocus) {
-              _editorFocusNode.requestFocus();
-            }
-          },
-          behavior: HitTestBehavior.translucent,
-          child: SingleChildScrollView(
-            physics: const AlwaysScrollableScrollPhysics(
-                parent: BouncingScrollPhysics()),
-            padding: EdgeInsets.symmetric(
-              horizontal: widget.isMobile ? 20 : 36,
-              vertical: widget.isMobile ? 16 : 28,
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _titleController,
+                focusNode: _titleFocusNode,
+                style: TextStyle(
+                  fontSize: widget.isMobile ? 24 : 26,
+                  fontWeight: FontWeight.w700,
+                  height: 1.25,
+                  color: theme.colorScheme.onSurface,
+                ),
+                maxLines: null,
+                decoration: InputDecoration(
+                  hintText: 'Заголовок заметки',
+                  hintStyle: TextStyle(
+                    fontSize: widget.isMobile ? 24 : 26,
+                    fontWeight: FontWeight.w700,
+                    height: 1.25,
+                    color: theme.colorScheme.onSurfaceVariant
+                        .withOpacity(0.4),
+                  ),
+                  border: InputBorder.none,
+                  isDense: true,
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
             ),
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 680),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: _titleController,
-                            style: TextStyle(
-                              fontSize: 28,
-                              fontWeight: FontWeight.w700,
-                              height: 1.25,
-                              color: theme.colorScheme.onSurface,
-                            ),
-                            maxLines: null,
-                            decoration: InputDecoration(
-                              hintText: 'Заголовок заметки',
-                              hintStyle: TextStyle(
-                                fontSize: 28,
-                                fontWeight: FontWeight.w700,
-                                height: 1.25,
-                                color: theme.colorScheme.onSurfaceVariant
-                                    .withAlpha(120),
-                              ),
-                              border: InputBorder.none,
-                              isDense: true,
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        _buildStatusDot(),
-                      ],
-                    ),
-                    const SizedBox(height: 24),
+            const SizedBox(width: 12),
+            _buildStatusDot(),
+          ],
+        ),
+
+        // Тонкий деликатный разделитель под заголовком
+        Container(
+          height: 1,
+          margin: EdgeInsets.only(
+            top: widget.isMobile ? 14 : 18,
+            bottom: widget.isMobile ? 18 : 22,
+          ),
+          color: isDark
+              ? Colors.white.withOpacity(0.07)
+              : Colors.black.withOpacity(0.06),
+        ),
                     QuillEditor(
                       controller: _quillController,
                       focusNode: _editorFocusNode,
@@ -2454,9 +2585,59 @@ class _NoteEditorViewState extends State<NoteEditorView>
                     ),
                     const SizedBox(height: 120),
                   ],
+                );
+
+    final Widget editorLayout = widget.isMobile
+        ? Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            child: editorBody,
+          )
+        : Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 780),
+              child: MouseRegion(
+                onEnter: (_) => setState(() => _isCardHovered = true),
+                onExit: (_) => setState(() => _isCardHovered = false),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  curve: Curves.easeOutCubic,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 40, vertical: 32),
+                  decoration: BoxDecoration(
+                    color: isDark ? const Color(0xFF141518) : Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: sheetBorderColor, width: 1.0),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(isDark ? 0.40 : 0.05),
+                        blurRadius: isEditorActive ? 28 : 16,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: editorBody,
                 ),
               ),
             ),
+          );
+
+    return Stack(
+      children: [
+        GestureDetector(
+          onTap: () {
+            if (!_editorFocusNode.hasFocus) {
+              _editorFocusNode.requestFocus();
+            }
+          },
+          behavior: HitTestBehavior.translucent,
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(
+                parent: BouncingScrollPhysics()),
+            padding: EdgeInsets.symmetric(
+              horizontal: widget.isMobile ? 0 : 28,
+              vertical: widget.isMobile ? 8 : 24,
+            ),
+            child: editorLayout,
           ),
         ),
         if (_showFloatingToolbar && !widget.isMobile)
