@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as img;
 import 'package:pasteboard/pasteboard.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -162,6 +163,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _periodicSyncTimer?.cancel();
+    _incomingSyncDebounce?.cancel();
     WebPasteListener.setNewNoteHandler(null);
     _searchController.dispose();
     _searchFocusNode.dispose();
@@ -202,6 +204,17 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
     }
   }
 
+  Timer? _incomingSyncDebounce;
+
+  void _onRemoteSyncSignal() {
+    _incomingSyncDebounce?.cancel();
+    _incomingSyncDebounce = Timer(const Duration(milliseconds: 300), () {
+      if (mounted) {
+        _syncFromCloudSilently();
+      }
+    });
+  }
+
   void _setupRealtime() {
     _realtimeChannel?.unsubscribe();
     _realtimeChannel = Supabase.instance.client
@@ -211,13 +224,13 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
           schema: 'public',
           table: 'notes',
           callback: (_) {
-            _syncFromCloudSilently();
+            _onRemoteSyncSignal();
           },
         )
         .onBroadcast(
           event: 'sync',
           callback: (_) {
-            _syncFromCloudSilently();
+            _onRemoteSyncSignal();
           },
         )
         .subscribe();
@@ -938,7 +951,7 @@ class _NoteCardItemState extends State<_NoteCardItem> {
   }
 }
 
-class NoteEditorPage extends StatelessWidget {
+class NoteEditorPage extends StatefulWidget {
   final Note initialNote;
   final String vaultId;
   final ValueNotifier<List<Note>> notesNotifier;
@@ -957,33 +970,46 @@ class NoteEditorPage extends StatelessWidget {
   });
 
   @override
+  State<NoteEditorPage> createState() => _NoteEditorPageState();
+}
+
+class _NoteEditorPageState extends State<NoteEditorPage> {
+  late String _title;
+
+  @override
+  void initState() {
+    super.initState();
+    _title = widget.initialNote.title;
+  }
+
+  void _handleNoteUpdated(
+      String id, String title, String plainText, String content) {
+    widget.onNoteUpdated(id, title, plainText, content);
+    if (mounted && _title != title) {
+      setState(() {
+        _title = title;
+      });
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<List<Note>>(
-      valueListenable: notesNotifier,
-      builder: (context, notes, _) {
-        final currentNote = notes.firstWhere(
-          (n) => n.id == initialNote.id,
-          orElse: () => initialNote,
-        );
-        return Scaffold(
-          appBar: AppBar(
-            title:
-                Text(currentNote.title.isEmpty ? 'Заметка' : currentNote.title),
-            elevation: 0,
-          ),
-          body: NoteEditorView(
-            key: ValueKey(currentNote.id),
-            note: currentNote,
-            vaultId: vaultId,
-            onNoteUpdated: onNoteUpdated,
-            onDeleteRequested: () {
-              Navigator.of(context).pop();
-              onNoteDeleted(currentNote.id);
-            },
-            onBroadcastSync: onBroadcastSync,
-          ),
-        );
-      },
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_title.isEmpty ? 'Заметка' : _title),
+        elevation: 0,
+      ),
+      body: NoteEditorView(
+        key: ValueKey(widget.initialNote.id),
+        note: widget.initialNote,
+        vaultId: widget.vaultId,
+        onNoteUpdated: _handleNoteUpdated,
+        onDeleteRequested: () {
+          Navigator.of(context).pop();
+          widget.onNoteDeleted(widget.initialNote.id);
+        },
+        onBroadcastSync: widget.onBroadcastSync,
+      ),
     );
   }
 }
@@ -1620,7 +1646,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     _lastLocalEditTime = DateTime.now();
     _isSavedNotifier.value = false;
     _debounceTimer?.cancel();
-    _debounceTimer = Timer(const Duration(milliseconds: 350), _saveNote);
+    _debounceTimer = Timer(const Duration(milliseconds: 700), _saveNote);
   }
 
   Future<void> _saveNote() async {
@@ -1678,41 +1704,22 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
   Future<Uint8List> _optimizeImageBytes(Uint8List bytes) async {
     try {
-      if (bytes.length < 300 * 1024) {
-        return bytes;
-      }
-      final codec = await ui.instantiateImageCodec(bytes);
-      final frame = await codec.getNextFrame();
-      final image = frame.image;
-      final width = image.width;
-      final height = image.height;
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) return bytes;
 
-      const maxDim = 1600;
-      if (width <= maxDim && height <= maxDim) {
-        return bytes;
-      }
-
-      int targetWidth = width;
-      int targetHeight = height;
-      if (width > height) {
-        targetWidth = maxDim;
-        targetHeight = (height * maxDim / width).round();
-      } else {
-        targetHeight = maxDim;
-        targetWidth = (width * maxDim / height).round();
+      const maxDim = 1400;
+      img.Image resized = decoded;
+      if (decoded.width > maxDim || decoded.height > maxDim) {
+        if (decoded.width > decoded.height) {
+          resized = img.copyResize(decoded, width: maxDim);
+        } else {
+          resized = img.copyResize(decoded, height: maxDim);
+        }
       }
 
-      final targetCodec = await ui.instantiateImageCodec(
-        bytes,
-        targetWidth: targetWidth,
-        targetHeight: targetHeight,
-      );
-      final targetFrame = await targetCodec.getNextFrame();
-      final targetImg = targetFrame.image;
-      final byteData =
-          await targetImg.toByteData(format: ui.ImageByteFormat.png);
-      if (byteData != null) {
-        return byteData.buffer.asUint8List();
+      final compressed = img.encodeJpg(resized, quality: 82);
+      if (compressed.isNotEmpty) {
+        return Uint8List.fromList(compressed);
       }
     } catch (e) {
       debugPrint('Optimization error: $e');
@@ -1795,14 +1802,14 @@ class _NoteEditorViewState extends State<NoteEditorView> {
           index < 0 ? _quillController.document.length - 1 : index;
       final safeLength = length < 0 ? 0 : length;
 
-      // 1. МГНОВЕННОЕ локальное превью (0 мс задержки!)
-      final isJpeg = bytes.length > 2 && bytes[0] == 0xFF && bytes[1] == 0xD8;
-      final mime = isJpeg ? 'image/jpeg' : 'image/png';
-      final tempBase64 = base64Encode(bytes);
-      final localDataUrl = 'data:$mime;base64,$tempBase64';
+      // 1. Быстрая оптимизация до компактного JPEG прямо в памяти
+      final optimized = await _optimizeImageBytes(bytes);
+
+      final tempBase64 = base64Encode(optimized);
+      final localDataUrl = 'data:image/jpeg;base64,$tempBase64';
 
       // Сохраняем байты в кэш для мгновенного плавного рендера
-      AppImageCache.put(localDataUrl, bytes);
+      AppImageCache.put(localDataUrl, optimized);
 
       _quillController.replaceText(
         safeIndex,
@@ -1821,12 +1828,12 @@ class _NoteEditorViewState extends State<NoteEditorView> {
       _isSavedNotifier.value = false;
       _isSavingNotifier.value = true;
 
-      // 2. Фоновая оптимизированная загрузка в Supabase Storage
+      // 2. Фоновая отправка легковесных 150 КБ в Supabase Storage
       try {
-        final cloudUrl = await _uploadImageToStorage(bytes);
+        final cloudUrl = await _uploadImageToStorage(optimized);
         if (cloudUrl != null && mounted) {
           // Кэшируем байты по cloudUrl ДО подмены в документе, чтобы не было мерцания
-          AppImageCache.put(cloudUrl, bytes);
+          AppImageCache.put(cloudUrl, optimized);
           // Подменяем локальный base64 постоянным облачным URL
           _replaceImageSourceInDocument(localDataUrl, cloudUrl);
           _saveNote();

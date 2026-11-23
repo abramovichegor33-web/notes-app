@@ -2,8 +2,17 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_quill/flutter_quill.dart';
+import 'package:image/image.dart' as img;
 
 void main() {
+  test('Image package can decode and compress to JPG', () {
+    final image = img.Image(width: 100, height: 100);
+    img.fill(image, color: img.ColorRgb8(255, 0, 0));
+    final jpg = img.encodeJpg(image, quality: 80);
+    expect(jpg.isNotEmpty, true);
+    expect(jpg[0], 0xFF);
+    expect(jpg[1], 0xD8); // JPEG SOI marker
+  });
   test('QuillController document assignment works', () {
     final c = QuillController.basic();
     expect(c.document.toPlainText().trim(), isEmpty);
