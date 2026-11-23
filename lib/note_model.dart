@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 class Note {
   final String id;
   final String vaultId;
@@ -5,6 +7,7 @@ class Note {
   final String content;
   final String plainText;
   final DateTime updatedAt;
+  final bool isPinned;
 
   Note({
     required this.id,
@@ -13,6 +16,7 @@ class Note {
     required this.content,
     required this.plainText,
     required this.updatedAt,
+    this.isPinned = false,
   });
 
   Note copyWith({
@@ -22,6 +26,7 @@ class Note {
     String? content,
     String? plainText,
     DateTime? updatedAt,
+    bool? isPinned,
   }) {
     return Note(
       id: id ?? this.id,
@@ -30,18 +35,32 @@ class Note {
       content: content ?? this.content,
       plainText: plainText ?? this.plainText,
       updatedAt: updatedAt ?? this.updatedAt,
+      isPinned: isPinned ?? this.isPinned,
     );
   }
 
   factory Note.fromMap(Map<dynamic, dynamic> map) {
+    final rawContent = (map['content'] ?? '').toString();
+    bool pinned = map['is_pinned'] == true || map['is_pinned'] == 1;
+
+    if (!pinned && rawContent.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawContent);
+        if (decoded is Map && decoded['is_pinned'] == true) {
+          pinned = true;
+        }
+      } catch (_) {}
+    }
+
     return Note(
       id: (map['id'] ?? '').toString(),
       vaultId: (map['vault_id'] ?? '').toString(),
       title: (map['title'] ?? '').toString(),
-      content: (map['content'] ?? '').toString(),
+      content: rawContent,
       plainText: (map['plain_text'] ?? '').toString(),
       updatedAt: DateTime.tryParse((map['updated_at'] ?? '').toString()) ??
           DateTime.now(),
+      isPinned: pinned,
     );
   }
 

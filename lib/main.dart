@@ -9,6 +9,9 @@ const String supabaseUrl = 'https://fvkbsnzvluhnxsbzeivy.supabase.co';
 const String supabaseAnonKey =
     'sb_publishable_Wv1HBMHDBJFkIfwOjCi89A_OMXEQvnS';
 
+final ValueNotifier<ThemeMode> appThemeModeNotifier =
+    ValueNotifier<ThemeMode>(ThemeMode.system);
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -16,6 +19,9 @@ Future<void> main() async {
     url: supabaseUrl,
     anonKey: supabaseAnonKey,
   );
+
+  final savedTheme = await VaultService.getThemeMode();
+  appThemeModeNotifier.value = savedTheme;
 
   runApp(const NotesApp());
 }
@@ -47,70 +53,98 @@ class _NotesAppState extends State<NotesApp> {
   Widget build(BuildContext context) {
     const accentColor = Color(0xFF6366F1);
 
-    return MaterialApp(
-      title: 'Заметки',
-      debugShowCheckedModeBanner: false,
-      localizationsDelegates: const [
-        GlobalMaterialLocalizations.delegate,
-        GlobalWidgetsLocalizations.delegate,
-        GlobalCupertinoLocalizations.delegate,
-        FlutterQuillLocalizations.delegate,
-      ],
-      supportedLocales: const [
-        Locale('ru', 'RU'),
-        Locale('en', 'US'),
-      ],
-      theme: ThemeData(
-        brightness: Brightness.light,
-        scaffoldBackgroundColor: const Color(0xFFFFFFFF),
-        colorScheme: ColorScheme.light(
-          primary: accentColor,
-          surface: const Color(0xFFF8FAFC),
-          onSurface: const Color(0xFF0F172A),
-          surfaceContainerHighest: const Color(0xFFF1F5F9),
-          outlineVariant: const Color(0xFFE2E8F0),
-        ),
-        dividerColor: const Color(0xFFE2E8F0),
-        textSelectionTheme: const TextSelectionThemeData(
-          cursorColor: accentColor,
-          selectionColor: Color(0x4D6366F1),
-          selectionHandleColor: accentColor,
-        ),
-        useMaterial3: true,
+    final darkTheme = ThemeData(
+      brightness: Brightness.dark,
+      scaffoldBackgroundColor: const Color(0xFF0F1012), // Soft Obsidian
+      canvasColor: const Color(0xFF0F1012),
+      cardColor: const Color(0xFF1E2025),
+      colorScheme: const ColorScheme.dark(
+        primary: accentColor,
+        surface: Color(0xFF141518), // Sidebar background
+        onSurface: Color(0xFFEDEDEF), // Primary text
+        onSurfaceVariant: Color(0xFF7E828C), // Secondary text
+        surfaceContainerHighest: Color(0xFF1E2025), // Active note
+        outlineVariant: Color(0xFF22242A), // Subtle separator
       ),
-      darkTheme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF141416),
-        colorScheme: const ColorScheme.dark(
-          primary: Color(0xFF818CF8),
-          surface: Color(0xFF1A1A1E),
-          onSurface: Color(0xFFF4F4F5),
-          surfaceContainerHighest: Color(0xFF222228),
-          outlineVariant: Color(0xFF2D2D34),
-        ),
-        dividerColor: const Color(0xFF27272E),
-        textSelectionTheme: const TextSelectionThemeData(
-          cursorColor: Color(0xFF818CF8),
-          selectionColor: Color(0x55818CF8),
-          selectionHandleColor: Color(0xFF818CF8),
-        ),
-        useMaterial3: true,
+      dividerColor: const Color(0xFF22242A),
+      textSelectionTheme: const TextSelectionThemeData(
+        cursorColor: accentColor,
+        selectionColor: Color(0x406366F1),
+        selectionHandleColor: accentColor,
       ),
-      themeMode: ThemeMode.system,
-      home: _vaultId == null
-          ? const Scaffold(
-              body: Center(
-                child: SizedBox(
-                  width: 32,
-                  height: 32,
-                  child: CircularProgressIndicator(strokeWidth: 2.5),
+      scrollbarTheme: ScrollbarThemeData(
+        thumbVisibility: const WidgetStatePropertyAll(false),
+        radius: const Radius.circular(8),
+        thickness: const WidgetStatePropertyAll(5),
+        thumbColor: WidgetStatePropertyAll(Colors.white.withAlpha(50)),
+      ),
+      useMaterial3: true,
+    );
+
+    final lightTheme = ThemeData(
+      brightness: Brightness.light,
+      scaffoldBackgroundColor: const Color(0xFFFAFAFB), // Soft Paper
+      canvasColor: const Color(0xFFFAFAFB),
+      cardColor: const Color(0xFFFFFFFF),
+      colorScheme: const ColorScheme.light(
+        primary: accentColor,
+        surface: Color(0xFFF2F3F5), // Sidebar background
+        onSurface: Color(0xFF1A1B1E), // Primary text
+        onSurfaceVariant: Color(0xFF6E737D), // Secondary text
+        surfaceContainerHighest: Color(0xFFFFFFFF), // Active note
+        outlineVariant: Color(0xFFE5E7EB), // Subtle separator
+      ),
+      dividerColor: const Color(0xFFE5E7EB),
+      textSelectionTheme: const TextSelectionThemeData(
+        cursorColor: accentColor,
+        selectionColor: Color(0x336366F1),
+        selectionHandleColor: accentColor,
+      ),
+      scrollbarTheme: ScrollbarThemeData(
+        thumbVisibility: const WidgetStatePropertyAll(false),
+        radius: const Radius.circular(8),
+        thickness: const WidgetStatePropertyAll(5),
+        thumbColor: WidgetStatePropertyAll(Colors.black.withAlpha(50)),
+      ),
+      useMaterial3: true,
+    );
+
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: appThemeModeNotifier,
+      builder: (context, themeMode, _) {
+        return MaterialApp(
+          title: 'Заметки',
+          debugShowCheckedModeBanner: false,
+          localizationsDelegates: const [
+            GlobalMaterialLocalizations.delegate,
+            GlobalWidgetsLocalizations.delegate,
+            GlobalCupertinoLocalizations.delegate,
+            FlutterQuillLocalizations.delegate,
+          ],
+          supportedLocales: const [
+            Locale('ru', 'RU'),
+            Locale('en', 'US'),
+          ],
+          theme: lightTheme,
+          darkTheme: darkTheme,
+          themeMode: themeMode,
+          home: _vaultId == null
+              ? const Scaffold(
+                  body: Center(
+                    child: SizedBox(
+                      width: 28,
+                      height: 28,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ),
+                )
+              : NotesScreen(
+                  vaultId: _vaultId!,
+                  onVaultChanged: (newVault) =>
+                      setState(() => _vaultId = newVault),
                 ),
-              ),
-            )
-          : NotesScreen(
-              vaultId: _vaultId!,
-              onVaultChanged: (newVault) => setState(() => _vaultId = newVault),
-            ),
+        );
+      },
     );
   }
 }

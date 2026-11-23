@@ -1,38 +1,29 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-
+import 'dart:ui';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_quill/flutter_quill.dart';
-import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 import 'package:pasteboard/pasteboard.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-
+import 'main.dart';
 import 'note_model.dart';
-import 'sync_dialog.dart';
+import 'vault_service.dart';
 import 'web_paste.dart';
-
-String _generateUuid() {
-  final random = Random();
-  final bytes = List<int>.generate(16, (_) => random.nextInt(256));
-  bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
-  bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant
-  final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
-}
 
 class NotesScreen extends StatefulWidget {
   final String vaultId;
-  final ValueChanged<String> onVaultChanged;
+  final ValueChanged<String>? onVaultChanged;
 
   const NotesScreen({
     super.key,
     required this.vaultId,
-    required this.onVaultChanged,
+    this.onVaultChanged,
   });
 
   @override
@@ -51,6 +42,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   Note? _selectedNote;
   RealtimeChannel? _realtimeChannel;
   Timer? _periodicSyncTimer;
+  Timer? _incomingSyncDebounce;
 
   @override
   void initState() {
@@ -72,7 +64,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
 
   void _startPeriodicSync() {
     _periodicSyncTimer?.cancel();
-    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 4), (_) {
       _syncFromCloudSilently();
     });
   }
@@ -109,7 +101,8 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
         for (int i = 0; i < cloudNotes.length; i++) {
           if (cloudNotes[i].id != _notes[i].id ||
               cloudNotes[i].title != _notes[i].title ||
-              cloudNotes[i].content != _notes[i].content) {
+              cloudNotes[i].content != _notes[i].content ||
+              cloudNotes[i].isPinned != _notes[i].isPinned) {
             hasChanges = true;
             break;
           }
@@ -125,7 +118,8 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
           if (match.isNotEmpty) {
             final remoteNote = match.first;
             if (remoteNote.title != _selectedNote!.title ||
-                remoteNote.content != _selectedNote!.content) {
+                remoteNote.content != _selectedNote!.content ||
+                remoteNote.isPinned != _selectedNote!.isPinned) {
               setState(() {
                 _selectedNote = remoteNote;
               });
@@ -173,7 +167,6 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _fetchNotes() async {
-    setState(() => _isLoading = true);
     try {
       final response = await Supabase.instance.client
           .from('notes')
@@ -181,788 +174,1019 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
           .eq('vault_id', widget.vaultId)
           .order('updated_at', ascending: false);
 
-      final fetched =
+      final list =
           (response as List).map((e) => Note.fromMap(e as Map)).toList();
 
       if (mounted) {
-        _notes = fetched;
-        _notesNotifier.value = List.of(_notes);
         setState(() {
+          _notes = list;
+          _notesNotifier.value = List.of(_notes);
           _isLoading = false;
-          if (_selectedNote != null) {
-            final match = _notes.where((n) => n.id == _selectedNote!.id);
-            _selectedNote = match.isNotEmpty ? match.first : null;
-          }
           if (_selectedNote == null && _notes.isNotEmpty) {
             _selectedNote = _notes.first;
           }
         });
       }
     } catch (e) {
-      debugPrint('Fetch notes error: $e');
+      debugPrint('Error fetching notes: $e');
       if (mounted) {
         setState(() => _isLoading = false);
-        if (_notes.isEmpty) {
-          Future.delayed(const Duration(seconds: 2), () {
-            if (mounted && _notes.isEmpty) {
-              _fetchNotes();
-            }
-          });
-        }
       }
     }
   }
 
-  Timer? _incomingSyncDebounce;
-
-  void _onRemoteSyncSignal() {
-    _incomingSyncDebounce?.cancel();
-    _incomingSyncDebounce = Timer(const Duration(milliseconds: 300), () {
-      if (mounted) {
-        _syncFromCloudSilently();
-      }
-    });
-  }
-
   void _setupRealtime() {
     _realtimeChannel?.unsubscribe();
-    _realtimeChannel = Supabase.instance.client
-        .channel('notes_vault_${widget.vaultId}')
-        .onPostgresChanges(
-          event: PostgresChangeEvent.all,
-          schema: 'public',
-          table: 'notes',
-          callback: (_) {
-            _onRemoteSyncSignal();
-          },
-        )
+    _realtimeChannel = Supabase.instance.client.channel('public:notes');
+
+    _realtimeChannel!
         .onBroadcast(
           event: 'sync',
-          callback: (_) {
-            _onRemoteSyncSignal();
+          callback: (payload) {
+            final vault = payload['vault'];
+            if (vault == widget.vaultId && mounted) {
+              _incomingSyncDebounce?.cancel();
+              _incomingSyncDebounce =
+                  Timer(const Duration(milliseconds: 300), () {
+                _syncFromCloudSilently();
+              });
+            }
           },
         )
         .subscribe();
   }
 
-  void _onNoteLocallyUpdated(
-      String noteId, String newTitle, String newPlainText, String newContent) {
-    final index = _notes.indexWhere((n) => n.id == noteId);
+  Future<void> _createNewNote() async {
+    final newId = _generateUuidV4();
+    final newNote = Note(
+      id: newId,
+      vaultId: widget.vaultId,
+      title: '',
+      content: jsonEncode([
+        {'insert': '\n'}
+      ]),
+      plainText: '',
+      updatedAt: DateTime.now(),
+      isPinned: false,
+    );
+
+    setState(() {
+      _notes.insert(0, newNote);
+      _notesNotifier.value = List.of(_notes);
+      _selectedNote = newNote;
+    });
+
+    try {
+      await Supabase.instance.client.from('notes').insert(newNote.toMap());
+      _broadcastSync();
+    } catch (e) {
+      debugPrint('Error creating note: $e');
+    }
+  }
+
+  Future<void> _deleteNote(String id) async {
+    final noteIndex = _notes.indexWhere((n) => n.id == id);
+    if (noteIndex == -1) return;
+
+    final removedNote = _notes[noteIndex];
+    setState(() {
+      _notes.removeAt(noteIndex);
+      _notesNotifier.value = List.of(_notes);
+      if (_selectedNote?.id == id) {
+        _selectedNote = _notes.isNotEmpty ? _notes.first : null;
+      }
+    });
+
+    try {
+      await Supabase.instance.client.from('notes').delete().eq('id', id);
+      _broadcastSync();
+    } catch (e) {
+      debugPrint('Error deleting note: $e');
+      if (mounted) {
+        setState(() {
+          _notes.insert(noteIndex, removedNote);
+          _notesNotifier.value = List.of(_notes);
+        });
+      }
+    }
+  }
+
+  Future<void> _togglePinNote(Note note) async {
+    final newPinned = !note.isPinned;
+    final index = _notes.indexWhere((n) => n.id == note.id);
+    if (index == -1) return;
+
+    final updated = note.copyWith(isPinned: newPinned);
+
+    // Упаковываем статус is_pinned в JSON контента
+    String packagedContent = updated.content;
+    try {
+      final decoded = jsonDecode(updated.content);
+      if (decoded is List) {
+        packagedContent = jsonEncode({
+          'delta': decoded,
+          'is_pinned': newPinned,
+        });
+      } else if (decoded is Map) {
+        final map = Map<String, dynamic>.from(decoded);
+        map['is_pinned'] = newPinned;
+        packagedContent = jsonEncode(map);
+      }
+    } catch (_) {}
+
+    final noteToSave = updated.copyWith(content: packagedContent);
+
+    setState(() {
+      _notes[index] = noteToSave;
+      _notesNotifier.value = List.of(_notes);
+      if (_selectedNote?.id == note.id) {
+        _selectedNote = noteToSave;
+      }
+    });
+
+    try {
+      await Supabase.instance.client.from('notes').upsert({
+        'id': noteToSave.id,
+        'vault_id': noteToSave.vaultId,
+        'title': noteToSave.title,
+        'content': noteToSave.content,
+        'plain_text': noteToSave.plainText,
+        'updated_at': DateTime.now().toIso8601String(),
+      });
+      _broadcastSync();
+    } catch (e) {
+      debugPrint('Error toggling pin: $e');
+    }
+  }
+
+  void _handleNoteUpdated(
+      String id, String title, String plainText, String content) {
+    final index = _notes.indexWhere((n) => n.id == id);
     if (index != -1) {
-      final updated = _notes[index].copyWith(
-        title: newTitle,
-        plainText: newPlainText,
-        content: newContent,
+      final current = _notes[index];
+      final updated = current.copyWith(
+        title: title,
+        plainText: plainText,
+        content: content,
         updatedAt: DateTime.now(),
       );
+
       _notes[index] = updated;
       _notesNotifier.value = List.of(_notes);
-      if (_selectedNote?.id == noteId) {
+
+      if (_selectedNote?.id == id) {
         _selectedNote = updated;
       }
     }
   }
 
-  bool _isCreatingNote = false;
-  DateTime _lastCreateNoteTime = DateTime.fromMillisecondsSinceEpoch(0);
-
-  Future<void> _createNewNote() async {
-    final now = DateTime.now();
-    if (_isCreatingNote ||
-        now.difference(_lastCreateNoteTime).inMilliseconds < 600) {
-      return;
+  List<Note> get _filteredNotes {
+    var list = _notes;
+    if (_searchQuery.isNotEmpty) {
+      final q = _searchQuery.toLowerCase();
+      list = list.where((n) {
+        return n.title.toLowerCase().contains(q) ||
+            n.plainText.toLowerCase().contains(q);
+      }).toList();
     }
-    _isCreatingNote = true;
-    _lastCreateNoteTime = now;
-
-    try {
-      final newNote = Note(
-        id: _generateUuid(),
-        vaultId: widget.vaultId,
-        title: 'Новая заметка',
-        content: jsonEncode([
-          {'insert': '\n'}
-        ]),
-        plainText: '',
-        updatedAt: DateTime.now(),
-      );
-
-      _notes.insert(0, newNote);
-      _notesNotifier.value = List.of(_notes);
-      setState(() {
-        _selectedNote = newNote;
-      });
-
-      try {
-        await Supabase.instance.client.from('notes').insert(newNote.toMap());
-        _broadcastSync();
-      } catch (_) {}
-
-      if (mounted && MediaQuery.of(context).size.width < 720) {
-        Navigator.of(context).push(
-          MaterialPageRoute(
-            builder: (_) => NoteEditorPage(
-              initialNote: newNote,
-              vaultId: widget.vaultId,
-              notesNotifier: _notesNotifier,
-              onNoteUpdated: _onNoteLocallyUpdated,
-              onNoteDeleted: _deleteNote,
-              onBroadcastSync: _broadcastSync,
-            ),
-          ),
-        );
-      }
-    } finally {
-      _isCreatingNote = false;
-    }
+    // Сортировка: закрепленные всегда сверху, далее по дате
+    list.sort((a, b) {
+      if (a.isPinned && !b.isPinned) return -1;
+      if (!a.isPinned && b.isPinned) return 1;
+      return b.updatedAt.compareTo(a.updatedAt);
+    });
+    return list;
   }
 
-  Future<void> _confirmDeleteNote(Note note) async {
-    final confirmed = await showDialog<bool>(
+  void _showVaultDialog() {
+    final controller = TextEditingController(text: widget.vaultId);
+    showGeneralDialog(
       context: context,
-      builder: (ctx) {
-        final isDark = Theme.of(ctx).brightness == Brightness.dark;
-        return AlertDialog(
-          backgroundColor: isDark ? const Color(0xFF1E1E24) : Colors.white,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-          title: const Text('Удалить заметку?', style: TextStyle(fontSize: 18)),
-          content: Text(
-            'Заметка «${note.title.isEmpty ? "Без названия" : note.title}» будет удалена навсегда.',
-            style: const TextStyle(fontSize: 14),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(false),
-              child: const Text('Отмена'),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: Colors.red.shade600,
-                foregroundColor: Colors.white,
-              ),
-              onPressed: () => Navigator.of(ctx).pop(true),
-              child: const Text('Удалить'),
-            ),
-          ],
+      barrierDismissible: true,
+      barrierLabel: 'VaultDialog',
+      transitionDuration: const Duration(milliseconds: 220),
+      transitionBuilder: (context, a1, a2, child) {
+        final curve = CurvedAnimation(parent: a1, curve: Curves.easeOutCubic);
+        return ScaleTransition(
+          scale: Tween<double>(begin: 0.94, end: 1.0).animate(curve),
+          child: FadeTransition(opacity: curve, child: child),
         );
       },
-    );
+      pageBuilder: (context, anim1, anim2) {
+        final theme = Theme.of(context);
+        final isDark = theme.brightness == Brightness.dark;
 
-    if (confirmed == true) {
-      await _deleteNote(note.id);
-    }
-  }
-
-  Future<void> _deleteNote(String noteId) async {
-    _notes.removeWhere((n) => n.id == noteId);
-    _notesNotifier.value = List.of(_notes);
-    if (_selectedNote?.id == noteId) {
-      setState(() {
-        _selectedNote = _notes.isNotEmpty ? _notes.first : null;
-      });
-    }
-
-    try {
-      await Supabase.instance.client.from('notes').delete().eq('id', noteId);
-      _broadcastSync();
-    } catch (_) {}
-  }
-
-  void _openSyncDialog() {
-    showDialog(
-      context: context,
-      builder: (_) => SyncDialog(
-        currentVaultId: widget.vaultId,
-        onVaultChanged: (newVault) {
-          setState(() {
-            _selectedNote = null;
-          });
-          widget.onVaultChanged(newVault);
-        },
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final isDesktop = MediaQuery.of(context).size.width >= 720;
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    return CallbackShortcuts(
-      bindings: {
-        const SingleActivator(LogicalKeyboardKey.keyN, meta: true):
-            _createNewNote,
-        const SingleActivator(LogicalKeyboardKey.keyN, control: true):
-            _createNewNote,
-        const SingleActivator(LogicalKeyboardKey.keyF, meta: true): () {
-          _searchFocusNode.requestFocus();
-        },
-        const SingleActivator(LogicalKeyboardKey.keyF, control: true): () {
-          _searchFocusNode.requestFocus();
-        },
-      },
-      child: Focus(
-        autofocus: true,
-        child: Scaffold(
-          backgroundColor:
-              isDark ? const Color(0xFF141416) : const Color(0xFFFFFFFF),
-          body: Row(
-            children: [
-              // Боковая панель заметок (Sidebar)
-              Container(
-                width: isDesktop ? 330 : MediaQuery.of(context).size.width,
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? const Color(0xFF1A1A1E)
-                      : const Color(0xFFF8FAFC),
-                  border: isDesktop
-                      ? Border(
-                          right: BorderSide(
-                            color: isDark
-                                ? const Color(0xFF27272E)
-                                : const Color(0xFFE2E8F0),
-                            width: 1,
-                          ),
-                        )
-                      : null,
-                ),
-                child: Column(
-                  children: [
-                    _buildSidebarHeader(isDark),
-                    _buildSearchBar(isDark),
-                    Expanded(
-                      child: ValueListenableBuilder<List<Note>>(
-                        valueListenable: _notesNotifier,
-                        builder: (context, notesList, _) {
-                          final filteredNotes = notesList.where((n) {
-                            if (_searchQuery.isEmpty) return true;
-                            return n.title.toLowerCase().contains(_searchQuery) ||
-                                n.plainText.toLowerCase().contains(_searchQuery);
-                          }).toList();
-                          return _buildNotesListView(
-                              filteredNotes, isDark, isDesktop);
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-
-              // Правая область редактора заметки (Desktop)
-              if (isDesktop)
-                Expanded(
-                  child: _selectedNote == null
-                      ? _buildEmptyState(isDark)
-                      : NoteEditorView(
-                          key: ValueKey(_selectedNote!.id),
-                          note: _selectedNote!,
-                          vaultId: widget.vaultId,
-                          onNoteUpdated: _onNoteLocallyUpdated,
-                          onDeleteRequested: () =>
-                              _confirmDeleteNote(_selectedNote!),
-                          onBroadcastSync: _broadcastSync,
-                        ),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSidebarHeader(bool isDark) {
-    final accentColor = Theme.of(context).colorScheme.primary;
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(7),
-            decoration: BoxDecoration(
-              color: accentColor.withAlpha(isDark ? 40 : 25),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(Icons.edit_note_rounded, color: accentColor, size: 22),
-          ),
-          const SizedBox(width: 10),
-          const Text(
-            'Заметки',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-              letterSpacing: -0.3,
-            ),
-          ),
-          const SizedBox(width: 8),
-          ValueListenableBuilder<List<Note>>(
-            valueListenable: _notesNotifier,
-            builder: (context, notesList, _) {
-              return Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? Colors.white.withAlpha(16)
-                      : Colors.black.withAlpha(10),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  '${notesList.length}',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    color: isDark ? Colors.white70 : Colors.black54,
-                  ),
-                ),
-              );
-            },
-          ),
-          const Spacer(),
-          InkWell(
-            onTap: _openSyncDialog,
-            borderRadius: BorderRadius.circular(8),
+        return Center(
+          child: Material(
+            color: Colors.transparent,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+              width: 380,
+              padding: const EdgeInsets.all(28),
               decoration: BoxDecoration(
-                color: accentColor.withAlpha(isDark ? 35 : 20),
-                borderRadius: BorderRadius.circular(8),
+                color: isDark ? const Color(0xFF16181D) : Colors.white,
+                borderRadius: BorderRadius.circular(20),
                 border: Border.all(
-                  color: accentColor.withAlpha(isDark ? 90 : 60),
-                  width: 1,
+                  color: isDark
+                      ? Colors.white.withAlpha(20)
+                      : Colors.black.withAlpha(15),
                 ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withAlpha(isDark ? 80 : 30),
+                    blurRadius: 36,
+                    offset: const Offset(0, 16),
+                  ),
+                ],
               ),
-              child: Row(
+              child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.cloud_done_rounded, size: 14, color: accentColor),
-                  const SizedBox(width: 5),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'Синхронизация',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                          color: theme.colorScheme.onSurface,
+                        ),
+                      ),
+                      IconButton(
+                        icon: Icon(Icons.close_rounded,
+                            size: 20, color: theme.colorScheme.onSurfaceVariant),
+                        onPressed: () => Navigator.of(context).pop(),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(16),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withAlpha(20),
+                          blurRadius: 16,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: QrImageView(
+                      data: widget.vaultId,
+                      version: QrVersions.auto,
+                      size: 170,
+                      gapless: true,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
                   Text(
-                    widget.vaultId,
+                    'Отсканируйте камерой телефона или введите код на другом устройстве:',
+                    textAlign: TextAlign.center,
                     style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.8,
-                      color: isDark ? Colors.white : accentColor,
+                      fontSize: 13,
+                      height: 1.4,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: isDark
+                          ? const Color(0xFF1E2026)
+                          : const Color(0xFFF1F3F5),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: TextField(
+                      controller: controller,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 2,
+                      ),
+                      textCapitalization: TextCapitalization.characters,
+                      decoration: const InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'XXX-XXX',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 44,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF6366F1),
+                        foregroundColor: Colors.white,
+                        elevation: 0,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      onPressed: () async {
+                        final newCode = controller.text.trim().toUpperCase();
+                        if (newCode.isNotEmpty && newCode != widget.vaultId) {
+                          await VaultService.setVaultId(newCode);
+                          if (context.mounted) {
+                            Navigator.of(context).pop();
+                            widget.onVaultChanged?.call(newCode);
+                          }
+                        } else {
+                          Navigator.of(context).pop();
+                        }
+                      },
+                      child: const Text(
+                        'Подключить хранилище',
+                        style: TextStyle(
+                            fontSize: 14, fontWeight: FontWeight.w600),
+                      ),
                     ),
                   ),
                 ],
               ),
             ),
           ),
-          const SizedBox(width: 6),
-          FilledButton.icon(
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-              minimumSize: const Size(36, 36),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
+        );
+      },
+    );
+  }
+
+  void _toggleTheme() {
+    final current = appThemeModeNotifier.value;
+    final isDarkNow = current == ThemeMode.dark ||
+        (current == ThemeMode.system &&
+            WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+                Brightness.dark);
+
+    final nextMode = isDarkNow ? ThemeMode.light : ThemeMode.dark;
+    appThemeModeNotifier.value = nextMode;
+    VaultService.setThemeMode(nextMode);
+  }
+
+  static String _generateUuidV4() {
+    final rand = Random.secure();
+    final bytes = List<int>.generate(16, (_) => rand.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDesktop = MediaQuery.sizeOf(context).width >= 720;
+
+    if (isDesktop) {
+      return Scaffold(
+        body: Row(
+          children: [
+            SizedBox(
+              width: 270,
+              child: _buildSidebar(),
+            ),
+            VerticalDivider(
+              width: 1,
+              thickness: 1,
+              color: Theme.of(context).dividerColor.withAlpha(60),
+            ),
+            Expanded(
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 180),
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                transitionBuilder: (child, animation) {
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(
+                      position: Tween<Offset>(
+                        begin: const Offset(0, 0.015),
+                        end: Offset.zero,
+                      ).animate(CurvedAnimation(
+                        parent: animation,
+                        curve: Curves.easeOutCubic,
+                      )),
+                      child: child,
+                    ),
+                  );
+                },
+                child: _selectedNote == null
+                    ? KeyedSubtree(
+                        key: const ValueKey('empty_state'),
+                        child: _buildEmptyState(),
+                      )
+                    : KeyedSubtree(
+                        key: ValueKey(_selectedNote!.id),
+                        child: NoteEditorView(
+                          note: _selectedNote!,
+                          vaultId: widget.vaultId,
+                          onNoteUpdated: _handleNoteUpdated,
+                          onDeleteRequested: () =>
+                              _deleteNote(_selectedNote!.id),
+                          onBroadcastSync: _broadcastSync,
+                        ),
+                      ),
               ),
             ),
-            icon: const Icon(Icons.add, size: 18),
-            label: const Text('Новая',
-                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+          ],
+        ),
+      );
+    }
+
+    // Mobile layout
+    return Scaffold(
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      appBar: AppBar(
+        title: GestureDetector(
+          onTap: _showVaultDialog,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Заметки',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: Theme.of(context).colorScheme.onSurface,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).cardColor,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  widget.vaultId,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          IconButton(
+            icon: Icon(
+              Theme.of(context).brightness == Brightness.dark
+                  ? Icons.light_mode_rounded
+                  : Icons.dark_mode_rounded,
+              size: 20,
+            ),
+            tooltip: 'Переключить тему',
+            onPressed: _toggleTheme,
+          ),
+          IconButton(
+            icon: const Icon(Icons.add_rounded, size: 24),
+            tooltip: 'Новая заметка',
             onPressed: _createNewNote,
           ),
         ],
+        elevation: 0,
+        backgroundColor: Colors.transparent,
       ),
+      body: _buildMobileList(),
     );
   }
 
-  Widget _buildSearchBar(bool isDark) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      child: TextField(
-        controller: _searchController,
-        focusNode: _searchFocusNode,
-        decoration: InputDecoration(
-          hintText: 'Поиск заметок... (⌘F)',
-          hintStyle: TextStyle(
-            fontSize: 13,
-            color: isDark ? Colors.white38 : Colors.black38,
-          ),
-          prefixIcon: Icon(
-            Icons.search,
-            size: 18,
-            color: isDark ? Colors.white54 : Colors.black45,
-          ),
-          suffixIcon: _searchQuery.isNotEmpty
-              ? IconButton(
-                  icon: const Icon(Icons.clear, size: 16),
-                  onPressed: () {
-                    _searchController.clear();
-                    setState(() => _searchQuery = '');
-                  },
-                )
-              : null,
-          filled: true,
-          fillColor: isDark
-              ? const Color(0xFF23232A)
-              : const Color(0xFFEDF2F7),
-          isDense: true,
-          contentPadding:
-              const EdgeInsets.symmetric(vertical: 9, horizontal: 10),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(10),
-            borderSide: BorderSide.none,
-          ),
-        ),
-        onChanged: (val) =>
-            setState(() => _searchQuery = val.trim().toLowerCase()),
-      ),
-    );
-  }
-
-  Widget _buildNotesListView(
-      List<Note> notes, bool isDark, bool isDesktop) {
-    if (_isLoading && _notes.isEmpty) {
-      return const Center(
-        child: SizedBox(
-          width: 24,
-          height: 24,
-          child: CircularProgressIndicator(strokeWidth: 2),
-        ),
-      );
-    }
-
-    if (notes.isEmpty) {
-      return RefreshIndicator(
-        onRefresh: _fetchNotes,
-        child: SingleChildScrollView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          child: Container(
-            height: 400,
-            alignment: Alignment.center,
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  _searchQuery.isEmpty
-                      ? Icons.note_alt_outlined
-                      : Icons.search_off_rounded,
-                  size: 38,
-                  color: isDark ? Colors.white24 : Colors.black26,
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  _searchQuery.isEmpty
-                      ? 'Заметок пока нет\nНажмите «Новая», чтобы начать'
-                      : 'Ничего не найдено',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: isDark ? Colors.white38 : Colors.black45,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
-    }
-
-    return RefreshIndicator(
-      onRefresh: _fetchNotes,
-      child: ListView.builder(
-        physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-        itemCount: notes.length,
-      itemBuilder: (context, index) {
-        final note = notes[index];
-        final isSelected = isDesktop && _selectedNote?.id == note.id;
-
-        return _NoteCardItem(
-          note: note,
-          isSelected: isSelected,
-          isDark: isDark,
-          onTap: () {
-            setState(() => _selectedNote = note);
-            if (!isDesktop) {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => NoteEditorPage(
-                    initialNote: note,
-                    vaultId: widget.vaultId,
-                    notesNotifier: _notesNotifier,
-                    onNoteUpdated: _onNoteLocallyUpdated,
-                    onNoteDeleted: _deleteNote,
-                    onBroadcastSync: _broadcastSync,
-                  ),
-                ),
-              );
-            }
-          },
-          onDelete: () => _confirmDeleteNote(note),
-        );
-      },
-    ),
-    );
-  }
-
-  Widget _buildEmptyState(bool isDark) {
+  Widget _buildEmptyState() {
+    final theme = Theme.of(context);
     return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Icon(
-            Icons.article_outlined,
-            size: 52,
-            color: isDark ? Colors.white12 : Colors.black12,
+            Icons.edit_note_rounded,
+            size: 48,
+            color: theme.colorScheme.onSurfaceVariant.withAlpha(80),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 12),
           Text(
-            'Выберите заметку из списка',
+            'Выберите заметку или создайте новую',
             style: TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w500,
-              color: isDark ? Colors.white54 : Colors.black54,
+              fontSize: 14,
+              color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-          const SizedBox(height: 6),
-          Text(
-            'Или нажмите «Новая заметка» (⌘N)',
-            style: TextStyle(
-              fontSize: 13,
-              color: isDark ? Colors.white24 : Colors.black26,
+          const SizedBox(height: 16),
+          BouncingPressable(
+            onTap: _createNewNote,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              decoration: BoxDecoration(
+                color: const Color(0xFF6366F1),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.add_rounded, size: 18, color: Colors.white),
+                  SizedBox(width: 6),
+                  Text(
+                    'Новая заметка',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
       ),
     );
   }
+
+  Widget _buildSidebar() {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    return Container(
+      color: theme.colorScheme.surface,
+      child: Column(
+        children: [
+          // Header: Vault badge, theme switcher, new note button
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 12, 12),
+            child: Row(
+              children: [
+                GestureDetector(
+                  onTap: _showVaultDialog,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: isDark
+                          ? const Color(0xFF1F2228)
+                          : const Color(0xFFE5E7EB),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.cloud_outlined,
+                          size: 13,
+                          color: theme.colorScheme.primary,
+                        ),
+                        const SizedBox(width: 5),
+                        Text(
+                          widget.vaultId,
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.5,
+                            color: theme.colorScheme.primary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                IconButton(
+                  icon: Icon(
+                    isDark ? Icons.light_mode_rounded : Icons.dark_mode_rounded,
+                    size: 18,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                  tooltip: 'Сменить тему',
+                  onPressed: _toggleTheme,
+                  splashRadius: 18,
+                ),
+                BouncingPressable(
+                  onTap: _createNewNote,
+                  child: Container(
+                    padding: const EdgeInsets.all(7),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF6366F1),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Icon(
+                      Icons.add_rounded,
+                      size: 16,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Borderless search field
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+            child: Container(
+              height: 36,
+              decoration: BoxDecoration(
+                color: isDark
+                    ? const Color(0xFF1B1D22)
+                    : const Color(0xFFE9EBEF),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: TextField(
+                controller: _searchController,
+                focusNode: _searchFocusNode,
+                style: TextStyle(fontSize: 13, color: theme.colorScheme.onSurface),
+                onChanged: (val) => setState(() => _searchQuery = val),
+                decoration: InputDecoration(
+                  prefixIcon: Icon(
+                    Icons.search_rounded,
+                    size: 16,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                  prefixIconConstraints:
+                      const BoxConstraints(minWidth: 32, minHeight: 32),
+                  suffixIcon: _searchQuery.isNotEmpty
+                      ? GestureDetector(
+                          onTap: () {
+                            _searchController.clear();
+                            setState(() => _searchQuery = '');
+                          },
+                          child: Icon(
+                            Icons.close_rounded,
+                            size: 15,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        )
+                      : null,
+                  hintText: 'Поиск заметок... (⌘F)',
+                  hintStyle: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant.withAlpha(160),
+                  ),
+                  border: InputBorder.none,
+                  contentPadding: const EdgeInsets.symmetric(vertical: 9),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+
+          // Notes list
+          Expanded(
+            child: _isLoading
+                ? Center(
+                    child: SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: theme.colorScheme.primary,
+                      ),
+                    ),
+                  )
+                : _filteredNotes.isEmpty
+                    ? Center(
+                        child: Text(
+                          _searchQuery.isNotEmpty
+                              ? 'Ничего не найдено'
+                              : 'Нет заметок',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 4),
+                        itemCount: _filteredNotes.length,
+                        itemBuilder: (context, index) {
+                          final note = _filteredNotes[index];
+                          final isSelected = _selectedNote?.id == note.id;
+                          return _SidebarNoteCard(
+                            key: ValueKey(note.id),
+                            note: note,
+                            isSelected: isSelected,
+                            onTap: () => setState(() => _selectedNote = note),
+                            onPinToggle: () => _togglePinNote(note),
+                            onDelete: () => _deleteNote(note.id),
+                          );
+                        },
+                      ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMobileList() {
+    final theme = Theme.of(context);
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+          child: Container(
+            height: 38,
+            decoration: BoxDecoration(
+              color: Theme.of(context).brightness == Brightness.dark
+                  ? const Color(0xFF1B1D22)
+                  : const Color(0xFFE9EBEF),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: TextField(
+              controller: _searchController,
+              onChanged: (val) => setState(() => _searchQuery = val),
+              style: TextStyle(fontSize: 14, color: theme.colorScheme.onSurface),
+              decoration: InputDecoration(
+                prefixIcon: Icon(Icons.search_rounded,
+                    size: 18, color: theme.colorScheme.onSurfaceVariant),
+                prefixIconConstraints:
+                    const BoxConstraints(minWidth: 36, minHeight: 36),
+                hintText: 'Поиск заметок...',
+                hintStyle: TextStyle(
+                  fontSize: 13,
+                  color: theme.colorScheme.onSurfaceVariant.withAlpha(160),
+                ),
+                border: InputBorder.none,
+                contentPadding: const EdgeInsets.symmetric(vertical: 9),
+              ),
+            ),
+          ),
+        ),
+        Expanded(
+          child: _filteredNotes.isEmpty
+              ? Center(
+                  child: Text(
+                    _searchQuery.isNotEmpty
+                        ? 'Ничего не найдено'
+                        : 'Нет заметок',
+                    style: TextStyle(
+                        fontSize: 13,
+                        color: theme.colorScheme.onSurfaceVariant),
+                  ),
+                )
+              : ListView.builder(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  itemCount: _filteredNotes.length,
+                  itemBuilder: (context, index) {
+                    final note = _filteredNotes[index];
+                    return Dismissible(
+                      key: ValueKey(note.id),
+                      direction: DismissDirection.horizontal,
+                      background: Container(
+                        alignment: Alignment.centerLeft,
+                        padding: const EdgeInsets.only(left: 20),
+                        color: Colors.indigo.shade600,
+                        child: Icon(
+                          note.isPinned
+                              ? Icons.push_pin_outlined
+                              : Icons.push_pin_rounded,
+                          color: Colors.white,
+                        ),
+                      ),
+                      secondaryBackground: Container(
+                        alignment: Alignment.centerRight,
+                        padding: const EdgeInsets.only(right: 20),
+                        color: Colors.red.shade600,
+                        child: const Icon(Icons.delete_outline_rounded,
+                            color: Colors.white),
+                      ),
+                      confirmDismiss: (dir) async {
+                        if (dir == DismissDirection.startToEnd) {
+                          _togglePinNote(note);
+                          return false;
+                        } else {
+                          return true;
+                        }
+                      },
+                      onDismissed: (_) => _deleteNote(note.id),
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: _MobileNoteCard(
+                          note: note,
+                          onTap: () {
+                            Navigator.of(context).push(
+                              PageRouteBuilder(
+                                transitionDuration:
+                                    const Duration(milliseconds: 220),
+                                pageBuilder: (ctx, anim, _) =>
+                                    NoteMobileEditorScreen(
+                                  note: note,
+                                  vaultId: widget.vaultId,
+                                  notesNotifier: _notesNotifier,
+                                  onNoteUpdated: _handleNoteUpdated,
+                                  onNoteDeleted: _deleteNote,
+                                  onBroadcastSync: _broadcastSync,
+                                ),
+                                transitionsBuilder:
+                                    (ctx, anim, secondaryAnim, child) {
+                                  return SlideTransition(
+                                    position: Tween<Offset>(
+                                      begin: const Offset(1, 0),
+                                      end: Offset.zero,
+                                    ).animate(CurvedAnimation(
+                                      parent: anim,
+                                      curve: Curves.easeOutCubic,
+                                    )),
+                                    child: child,
+                                  );
+                                },
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
 }
 
-class _NoteCardItem extends StatefulWidget {
+// Bouncing Pressable widget with spring scale 0.97
+class BouncingPressable extends StatefulWidget {
+  final Widget child;
+  final VoidCallback? onTap;
+  final VoidCallback? onLongPress;
+
+  const BouncingPressable({
+    super.key,
+    required this.child,
+    this.onTap,
+    this.onLongPress,
+  });
+
+  @override
+  State<BouncingPressable> createState() => _BouncingPressableState();
+}
+
+class _BouncingPressableState extends State<BouncingPressable> {
+  bool _isPressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _isPressed = true),
+      onTapUp: (_) {
+        setState(() => _isPressed = false);
+        widget.onTap?.call();
+      },
+      onTapCancel: () => setState(() => _isPressed = false),
+      onLongPress: widget.onLongPress,
+      behavior: HitTestBehavior.opaque,
+      child: AnimatedScale(
+        scale: _isPressed ? 0.97 : 1.0,
+        duration: const Duration(milliseconds: 100),
+        curve: Curves.easeOutCubic,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+class _SidebarNoteCard extends StatefulWidget {
   final Note note;
   final bool isSelected;
-  final bool isDark;
   final VoidCallback onTap;
+  final VoidCallback onPinToggle;
   final VoidCallback onDelete;
 
-  const _NoteCardItem({
+  const _SidebarNoteCard({
+    super.key,
     required this.note,
     required this.isSelected,
-    required this.isDark,
     required this.onTap,
+    required this.onPinToggle,
     required this.onDelete,
   });
 
   @override
-  State<_NoteCardItem> createState() => _NoteCardItemState();
+  State<_SidebarNoteCard> createState() => _SidebarNoteCardState();
 }
 
-class _NoteCardItemState extends State<_NoteCardItem> {
+class _SidebarNoteCardState extends State<_SidebarNoteCard> {
   bool _isHovered = false;
-
-  void _copyNote() {
-    final t = widget.note.title.trim();
-    final p = widget.note.plainText.trim();
-    final text = t.isEmpty ? p : '$t\n\n$p';
-    Clipboard.setData(ClipboardData(text: text));
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: const Row(
-          children: [
-            Icon(Icons.check_circle, color: Colors.white, size: 18),
-            SizedBox(width: 8),
-            Text('Заметка скопирована в буфер обмена'),
-          ],
-        ),
-        backgroundColor: Colors.green.shade700,
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 2),
-      ),
-    );
-  }
-
-  void _showCardContextMenu(TapDownDetails details) async {
-    final overlay =
-        Overlay.of(context).context.findRenderObject() as RenderBox?;
-    if (overlay == null) return;
-
-    final position = details.globalPosition;
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    final selected = await showMenu<String>(
-      context: context,
-      position: RelativeRect.fromLTRB(
-        position.dx,
-        position.dy,
-        overlay.size.width - position.dx,
-        overlay.size.height - position.dy,
-      ),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      color: isDark ? const Color(0xFF222228) : Colors.white,
-      items: [
-        const PopupMenuItem<String>(
-          value: 'copy',
-          height: 38,
-          child: Row(
-            children: [
-              Icon(Icons.copy_rounded, size: 18),
-              SizedBox(width: 10),
-              Text('Скопировать текст',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-            ],
-          ),
-        ),
-        const PopupMenuDivider(height: 1),
-        PopupMenuItem<String>(
-          value: 'delete',
-          height: 38,
-          child: Row(
-            children: [
-              Icon(Icons.delete_outline_rounded,
-                  size: 18, color: Colors.red.shade400),
-              const SizedBox(width: 10),
-              Text(
-                'Удалить заметку',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: Colors.red.shade400,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-
-    if (!mounted) return;
-
-    if (selected == 'copy') {
-      _copyNote();
-    } else if (selected == 'delete') {
-      widget.onDelete();
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final accent = theme.colorScheme.primary;
+    final isDark = theme.brightness == Brightness.dark;
 
-    Color bgColor;
-    if (widget.isSelected) {
-      bgColor = widget.isDark
-          ? const Color(0xFF282832)
-          : const Color(0xFFEEF2FF);
-    } else if (_isHovered) {
-      bgColor = widget.isDark
-          ? const Color(0xFF202028)
-          : const Color(0xFFF1F5F9);
-    } else {
-      bgColor = Colors.transparent;
-    }
-
-    final title = widget.note.title.trim().isEmpty
-        ? 'Без названия'
-        : widget.note.title.trim();
-    final preview = widget.note.plainText.trim().isEmpty
-        ? 'Нет дополнительного текста'
-        : widget.note.plainText.replaceAll('\n', ' ').trim();
+    final title = widget.note.title.trim().isNotEmpty
+        ? widget.note.title.trim()
+        : 'Без названия';
+    final preview = widget.note.plainText.trim();
 
     return MouseRegion(
-      cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _isHovered = true),
       onExit: (_) => setState(() => _isHovered = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        onSecondaryTapDown: _showCardContextMenu,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 140),
-          margin: const EdgeInsets.symmetric(vertical: 3),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          decoration: BoxDecoration(
-            color: bgColor,
-            borderRadius: BorderRadius.circular(10),
-            border: widget.isSelected
-                ? Border.all(color: accent.withAlpha(120), width: 1.2)
-                : Border.all(color: Colors.transparent, width: 1.2),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: widget.isSelected
-                            ? FontWeight.bold
-                            : FontWeight.w600,
-                        color: widget.isDark
-                            ? Colors.white
-                            : const Color(0xFF0F172A),
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 3),
+        child: BouncingPressable(
+          onTap: widget.onTap,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 140),
+            curve: Curves.easeOutCubic,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            decoration: BoxDecoration(
+              color: widget.isSelected
+                  ? theme.colorScheme.surfaceContainerHighest
+                  : (_isHovered
+                      ? (isDark
+                          ? const Color(0xFF1B1D22)
+                          : const Color(0xFFE9EBEF))
+                      : Colors.transparent),
+              borderRadius: BorderRadius.circular(10),
+              boxShadow: widget.isSelected && !isDark
+                  ? [
+                      BoxShadow(
+                        color: Colors.black.withAlpha(8),
+                        blurRadius: 10,
+                        offset: const Offset(0, 2),
+                      )
+                    ]
+                  : null,
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    if (widget.note.isPinned) ...[
+                      Icon(
+                        Icons.push_pin_rounded,
+                        size: 12,
+                        color: theme.colorScheme.primary,
                       ),
-                    ),
-                  ),
-                  if (_isHovered || widget.isSelected) ...[
-                    InkWell(
-                      borderRadius: BorderRadius.circular(6),
-                      onTap: _copyNote,
-                      child: Padding(
-                        padding: const EdgeInsets.all(2),
-                        child: Icon(
-                          Icons.copy_rounded,
-                          size: 15,
-                          color: widget.isDark
-                              ? Colors.white60
-                              : Colors.black45,
+                      const SizedBox(width: 4),
+                    ],
+                    Expanded(
+                      child: Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: widget.isSelected
+                              ? FontWeight.w700
+                              : FontWeight.w600,
+                          color: theme.colorScheme.onSurface,
                         ),
                       ),
                     ),
                     const SizedBox(width: 4),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(6),
-                      onTap: widget.onDelete,
-                      child: Padding(
-                        padding: const EdgeInsets.all(2),
+                    if (_isHovered) ...[
+                      GestureDetector(
+                        onTap: widget.onPinToggle,
                         child: Icon(
-                          Icons.delete_outline,
-                          size: 16,
-                          color: Colors.red.withAlpha(180),
+                          widget.note.isPinned
+                              ? Icons.push_pin_rounded
+                              : Icons.push_pin_outlined,
+                          size: 14,
+                          color: widget.note.isPinned
+                              ? theme.colorScheme.primary
+                              : theme.colorScheme.onSurfaceVariant,
                         ),
                       ),
-                    ),
-                  ],
-                ],
-              ),
-              const SizedBox(height: 4),
-              Row(
-                children: [
-                  Text(
-                    widget.note.formattedDate,
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w500,
-                      color: widget.isSelected
-                          ? accent
-                          : (widget.isDark ? Colors.white54 : Colors.black45),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      preview,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: widget.isDark ? Colors.white38 : Colors.black45,
+                      const SizedBox(width: 6),
+                      GestureDetector(
+                        onTap: widget.onDelete,
+                        child: Icon(
+                          Icons.delete_outline_rounded,
+                          size: 14,
+                          color: Colors.red.shade400,
+                        ),
                       ),
+                    ] else
+                      Text(
+                        widget.note.formattedDate,
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: theme.colorScheme.onSurfaceVariant.withAlpha(180),
+                        ),
+                      ),
+                  ],
+                ),
+                if (preview.isNotEmpty) ...[
+                  const SizedBox(height: 3),
+                  Text(
+                    preview,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11,
+                      height: 1.3,
+                      color: theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
                 ],
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -970,17 +1194,107 @@ class _NoteCardItemState extends State<_NoteCardItem> {
   }
 }
 
-class NoteEditorPage extends StatefulWidget {
-  final Note initialNote;
+class _MobileNoteCard extends StatelessWidget {
+  final Note note;
+  final VoidCallback onTap;
+
+  const _MobileNoteCard({
+    required this.note,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    final title =
+        note.title.trim().isNotEmpty ? note.title.trim() : 'Без названия';
+    final preview = note.plainText.trim();
+
+    return BouncingPressable(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: theme.cardColor,
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: !isDark
+              ? [
+                  BoxShadow(
+                    color: Colors.black.withAlpha(6),
+                    blurRadius: 10,
+                    offset: const Offset(0, 2),
+                  ),
+                ]
+              : null,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                if (note.isPinned) ...[
+                  Icon(
+                    Icons.push_pin_rounded,
+                    size: 13,
+                    color: theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                Expanded(
+                  child: Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      color: theme.colorScheme.onSurface,
+                    ),
+                  ),
+                ),
+                Text(
+                  note.formattedDate,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+            if (preview.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Text(
+                preview,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 13,
+                  height: 1.4,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class NoteMobileEditorScreen extends StatefulWidget {
+  final Note note;
   final String vaultId;
   final ValueNotifier<List<Note>> notesNotifier;
-  final Function(String, String, String, String) onNoteUpdated;
-  final Function(String) onNoteDeleted;
-  final VoidCallback onBroadcastSync;
+  final Function(String id, String title, String plainText, String content)?
+      onNoteUpdated;
+  final Function(String id) onNoteDeleted;
+  final VoidCallback? onBroadcastSync;
 
-  const NoteEditorPage({
+  const NoteMobileEditorScreen({
     super.key,
-    required this.initialNote,
+    required this.note,
     required this.vaultId,
     required this.notesNotifier,
     required this.onNoteUpdated,
@@ -989,25 +1303,17 @@ class NoteEditorPage extends StatefulWidget {
   });
 
   @override
-  State<NoteEditorPage> createState() => _NoteEditorPageState();
+  State<NoteMobileEditorScreen> createState() => _NoteMobileEditorScreenState();
 }
 
-class _NoteEditorPageState extends State<NoteEditorPage> {
-  late String _title;
-
-  @override
-  void initState() {
-    super.initState();
-    _title = widget.initialNote.title;
-  }
+class _NoteMobileEditorScreenState extends State<NoteMobileEditorScreen> {
+  String _title = '';
 
   void _handleNoteUpdated(
       String id, String title, String plainText, String content) {
-    widget.onNoteUpdated(id, title, plainText, content);
+    widget.onNoteUpdated?.call(id, title, plainText, content);
     if (mounted && _title != title) {
-      setState(() {
-        _title = title;
-      });
+      setState(() => _title = title);
     }
   }
 
@@ -1017,23 +1323,34 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       valueListenable: widget.notesNotifier,
       builder: (context, notesList, _) {
         final currentNote = notesList.firstWhere(
-          (n) => n.id == widget.initialNote.id,
-          orElse: () => widget.initialNote,
+          (n) => n.id == widget.note.id,
+          orElse: () => widget.note,
         );
         return Scaffold(
+          backgroundColor: Theme.of(context).scaffoldBackgroundColor,
           appBar: AppBar(
-            title: Text(
-                _title.isNotEmpty ? _title : (currentNote.title.isEmpty ? 'Заметка' : currentNote.title)),
+            backgroundColor: Colors.transparent,
             elevation: 0,
+            leading: IconButton(
+              icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 18),
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+            title: Text(
+              _title.isNotEmpty
+                  ? _title
+                  : (currentNote.title.isEmpty ? 'Заметка' : currentNote.title),
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
           ),
           body: NoteEditorView(
-            key: ValueKey(widget.initialNote.id),
+            key: ValueKey(widget.note.id),
             note: currentNote,
             vaultId: widget.vaultId,
+            isMobile: true,
             onNoteUpdated: _handleNoteUpdated,
             onDeleteRequested: () {
               Navigator.of(context).pop();
-              widget.onNoteDeleted(widget.initialNote.id);
+              widget.onNoteDeleted(widget.note.id);
             },
             onBroadcastSync: widget.onBroadcastSync,
           ),
@@ -1058,64 +1375,65 @@ class AppImageCache {
 }
 
 class AppImageEmbedBuilder extends EmbedBuilder {
-  const AppImageEmbedBuilder();
+  final Function(String source)? onDeleteImage;
+  final Function(String source)? onCopyImage;
+
+  AppImageEmbedBuilder({this.onDeleteImage, this.onCopyImage});
 
   @override
   String get key => BlockEmbed.imageType;
 
   @override
-  bool get expanded => false;
-
-  @override
-  Widget build(BuildContext context, EmbedContext embedContext) {
-    return _AppImageItemWidget(embedContext: embedContext);
+  Widget build(
+    BuildContext context,
+    EmbedContext embedContext,
+  ) {
+    return _AppImageWidget(
+      embedContext: embedContext,
+      onDeleteImage: onDeleteImage,
+      onCopyImage: onCopyImage,
+    );
   }
 }
 
-class _AppImageItemWidget extends StatefulWidget {
+class _AppImageWidget extends StatefulWidget {
   final EmbedContext embedContext;
+  final Function(String source)? onDeleteImage;
+  final Function(String source)? onCopyImage;
 
-  const _AppImageItemWidget({required this.embedContext});
+  const _AppImageWidget({
+    required this.embedContext,
+    this.onDeleteImage,
+    this.onCopyImage,
+  });
 
   @override
-  State<_AppImageItemWidget> createState() => _AppImageItemWidgetState();
+  State<_AppImageWidget> createState() => _AppImageWidgetState();
 }
 
-class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
-  bool _isHovered = false;
-
+class _AppImageWidgetState extends State<_AppImageWidget> {
   void _deleteImage() {
-    final offset = widget.embedContext.node.documentOffset;
-    final length = widget.embedContext.node.length;
-    widget.embedContext.controller.replaceText(
-      offset,
-      length,
-      '',
-      null,
-    );
-    widget.embedContext.controller.updateSelection(
-      TextSelection.collapsed(offset: offset),
-      ChangeSource.local,
-    );
+    final imageSource = widget.embedContext.node.value.data.toString();
+    widget.onDeleteImage?.call(imageSource);
   }
 
   Future<void> _handleCopyImage(String imageSource) async {
     try {
-      Uint8List? bytes;
-      if (AppImageCache.has(imageSource)) {
-        bytes = AppImageCache.get(imageSource);
-      }
-      if (bytes == null || bytes.isEmpty) {
+      Uint8List? bytes = AppImageCache.get(imageSource);
+      if (bytes == null) {
         if (imageSource.startsWith('data:image/') ||
             imageSource.contains('base64')) {
-          final base64String =
-              imageSource.contains(',') ? imageSource.split(',')[1] : imageSource;
+          final base64String = imageSource.contains(',')
+              ? imageSource.split(',')[1]
+              : imageSource;
           bytes = base64Decode(base64String);
-        } else if (imageSource.startsWith('http://') ||
-            imageSource.startsWith('https://')) {
-          final res = await http.get(Uri.parse(imageSource));
-          if (res.statusCode == 200) {
-            bytes = res.bodyBytes;
+        } else {
+          final uri = Uri.tryParse(imageSource);
+          if (uri != null) {
+            final res = await Supabase.instance.client.storage
+                .from('note-images')
+                .download(uri.pathSegments.sublist(1).join('/'));
+            bytes = res;
           }
         }
       }
@@ -1133,12 +1451,13 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
             SnackBar(
               content: const Row(
                 children: [
-                  Icon(Icons.check_circle, color: Colors.white, size: 18),
+                  Icon(Icons.check_circle_rounded,
+                      color: Colors.white, size: 16),
                   SizedBox(width: 8),
-                  Text('Изображение скопировано в буфер обмена'),
+                  Text('Изображение скопировано в буфер'),
                 ],
               ),
-              backgroundColor: Colors.green.shade700,
+              backgroundColor: const Color(0xFF10B981),
               behavior: SnackBarBehavior.floating,
               duration: const Duration(seconds: 2),
             ),
@@ -1148,16 +1467,6 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
       }
     } catch (e) {
       debugPrint('Error copying image: $e');
-    }
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Не удалось скопировать изображение'),
-          behavior: SnackBarBehavior.floating,
-          duration: Duration(seconds: 2),
-        ),
-      );
     }
   }
 
@@ -1172,10 +1481,8 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
           children: [
             Center(
               child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: InteractiveViewer(
-                  child: imageWidget,
-                ),
+                borderRadius: BorderRadius.circular(16),
+                child: InteractiveViewer(child: imageWidget),
               ),
             ),
             Positioned(
@@ -1184,46 +1491,15 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Container(
-                    decoration: BoxDecoration(
-                      color: Colors.black.withAlpha(160),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: IconButton(
-                      icon: const Icon(Icons.copy_rounded,
-                          color: Colors.white, size: 20),
-                      tooltip: 'Скопировать изображение',
-                      onPressed: () => _handleCopyImage(imageSource),
-                    ),
+                  IconButton(
+                    icon: const Icon(Icons.copy_rounded, color: Colors.white),
+                    tooltip: 'Скопировать',
+                    onPressed: () => _handleCopyImage(imageSource),
                   ),
-                  const SizedBox(width: 8),
-                  Container(
-                    decoration: BoxDecoration(
-                      color: Colors.red.withAlpha(200),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: IconButton(
-                      icon: const Icon(Icons.delete_outline,
-                          color: Colors.white, size: 22),
-                      tooltip: 'Удалить изображение',
-                      onPressed: () {
-                        Navigator.of(dialogCtx).pop();
-                        _deleteImage();
-                      },
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Container(
-                    decoration: BoxDecoration(
-                      color: Colors.black.withAlpha(160),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: IconButton(
-                      icon: const Icon(Icons.close,
-                          color: Colors.white, size: 24),
-                      tooltip: 'Закрыть',
-                      onPressed: () => Navigator.of(dialogCtx).pop(),
-                    ),
+                  IconButton(
+                    icon: const Icon(Icons.close_rounded, color: Colors.white),
+                    tooltip: 'Закрыть',
+                    onPressed: () => Navigator.of(dialogCtx).pop(),
                   ),
                 ],
               ),
@@ -1251,61 +1527,54 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
         overlay.size.width - position.dx,
         overlay.size.height - position.dy,
       ),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      color: isDark ? const Color(0xFF222228) : Colors.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      color: isDark ? const Color(0xFF1E2026) : Colors.white,
       items: [
         const PopupMenuItem<String>(
           value: 'copy_image',
-          height: 38,
+          height: 36,
           child: Row(
             children: [
-              Icon(Icons.copy_rounded, size: 18),
-              SizedBox(width: 10),
-              Text(
-                'Скопировать изображение',
-                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-              ),
+              Icon(Icons.copy_rounded, size: 16),
+              SizedBox(width: 8),
+              Text('Скопировать картинку', style: TextStyle(fontSize: 13)),
             ],
           ),
         ),
         const PopupMenuItem<String>(
           value: 'copy_link',
-          height: 38,
+          height: 36,
           child: Row(
             children: [
-              Icon(Icons.link_rounded, size: 18),
-              SizedBox(width: 10),
+              Icon(Icons.link_rounded, size: 16),
+              SizedBox(width: 8),
               Text('Скопировать ссылку', style: TextStyle(fontSize: 13)),
             ],
           ),
         ),
         const PopupMenuItem<String>(
           value: 'view',
-          height: 38,
+          height: 36,
           child: Row(
             children: [
-              Icon(Icons.fullscreen_rounded, size: 18),
-              SizedBox(width: 10),
-              Text('Открыть на весь экран', style: TextStyle(fontSize: 13)),
+              Icon(Icons.fullscreen_rounded, size: 16),
+              SizedBox(width: 8),
+              Text('На весь экран', style: TextStyle(fontSize: 13)),
             ],
           ),
         ),
         const PopupMenuDivider(height: 1),
         PopupMenuItem<String>(
           value: 'delete',
-          height: 38,
+          height: 36,
           child: Row(
             children: [
               Icon(Icons.delete_outline_rounded,
-                  size: 18, color: Colors.red.shade400),
-              const SizedBox(width: 10),
+                  size: 16, color: Colors.red.shade400),
+              const SizedBox(width: 8),
               Text(
-                'Удалить изображение',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: Colors.red.shade400,
-                  fontWeight: FontWeight.w600,
-                ),
+                'Удалить',
+                style: TextStyle(fontSize: 13, color: Colors.red.shade400),
               ),
             ],
           ),
@@ -1314,18 +1583,10 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
     );
 
     if (!mounted) return;
-
     if (selected == 'copy_image') {
       _handleCopyImage(imageSource);
     } else if (selected == 'copy_link') {
       Clipboard.setData(ClipboardData(text: imageSource));
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Ссылка скопирована в буфер обмена'),
-          behavior: SnackBarBehavior.floating,
-          duration: Duration(seconds: 2),
-        ),
-      );
     } else if (selected == 'delete') {
       _deleteImage();
     } else if (selected == 'view') {
@@ -1340,10 +1601,7 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
     Widget imageWidget;
     final cachedBytes = AppImageCache.get(imageSource);
     if (cachedBytes != null) {
-      imageWidget = Image.memory(
-        cachedBytes,
-        fit: BoxFit.contain,
-      );
+      imageWidget = Image.memory(cachedBytes, fit: BoxFit.contain);
     } else if (imageSource.startsWith('data:image/') ||
         imageSource.contains('base64')) {
       final base64String =
@@ -1351,165 +1609,61 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
       try {
         final decoded = base64Decode(base64String);
         AppImageCache.put(imageSource, decoded);
-        imageWidget = Image.memory(
-          decoded,
-          fit: BoxFit.contain,
-        );
+        imageWidget = Image.memory(decoded, fit: BoxFit.contain);
       } catch (_) {
-        imageWidget = const Icon(Icons.broken_image, size: 40);
+        imageWidget = const Icon(Icons.broken_image_rounded, size: 40);
       }
     } else {
       imageWidget = Image.network(
         imageSource,
         fit: BoxFit.contain,
-        frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-          if (wasSynchronouslyLoaded || frame != null) {
-            return child;
-          }
+        loadingBuilder: (context, child, loadingProgress) {
+          if (loadingProgress == null) return child;
           return Container(
-            height: 160,
-            width: 220,
-            color: Colors.black12,
-            child: const Center(
-              child: SizedBox(
-                width: 24,
-                height: 24,
-                child: CircularProgressIndicator(strokeWidth: 2),
+            height: 180,
+            alignment: Alignment.center,
+            child: SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Theme.of(context).colorScheme.primary,
               ),
             ),
           );
         },
-        errorBuilder: (context, error, stackTrace) => Container(
-          height: 100,
-          width: 250,
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
-            color: Colors.red.withAlpha(20),
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: Colors.red.withAlpha(60)),
-          ),
-          child: const Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.broken_image, color: Colors.red),
-              SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Не удалось загрузить изображение',
-                  style: TextStyle(fontSize: 12),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ],
-          ),
-        ),
+        errorBuilder: (ctx, err, stack) =>
+            const Icon(Icons.broken_image_rounded, size: 40),
       );
     }
 
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: GestureDetector(
-        onTap: () => _showLightbox(imageWidget, imageSource),
-        onSecondaryTapDown: (details) =>
-            _showContextMenu(details, imageSource, imageWidget),
-        child: MouseRegion(
-          cursor: SystemMouseCursors.click,
-          onEnter: (_) => setState(() => _isHovered = true),
-          onExit: (_) => setState(() => _isHovered = false),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(
-              maxWidth: 550,
-              maxHeight: 450,
-            ),
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(
-                  color: isDark ? Colors.white30 : Colors.black26,
-                  width: 1.5,
-                ),
-                color: isDark
-                    ? Colors.white.withAlpha(12)
-                    : Colors.black.withAlpha(8),
-              ),
-              child: Stack(
-                children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8.5),
-                    child: imageWidget,
-                  ),
-                  if (_isHovered)
-                    Positioned(
-                      top: 8,
-                      right: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 4, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withAlpha(200),
-                          borderRadius: BorderRadius.circular(8),
-                          boxShadow: const [
-                            BoxShadow(
-                              color: Colors.black26,
-                              blurRadius: 4,
-                              offset: Offset(0, 2),
-                            ),
-                          ],
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              icon: const Icon(
-                                Icons.copy_rounded,
-                                size: 18,
-                                color: Colors.white,
-                              ),
-                              tooltip: 'Скопировать изображение',
-                              constraints: const BoxConstraints(
-                                minWidth: 32,
-                                minHeight: 32,
-                              ),
-                              padding: const EdgeInsets.all(6),
-                              onPressed: () => _handleCopyImage(imageSource),
-                            ),
-                            IconButton(
-                              icon: const Icon(
-                                Icons.fullscreen_rounded,
-                                size: 20,
-                                color: Colors.white,
-                              ),
-                              tooltip: 'Открыть на весь экран',
-                              constraints: const BoxConstraints(
-                                minWidth: 32,
-                                minHeight: 32,
-                              ),
-                              padding: const EdgeInsets.all(6),
-                              onPressed: () =>
-                                  _showLightbox(imageWidget, imageSource),
-                            ),
-                            IconButton(
-                              icon: Icon(
-                                Icons.delete_outline_rounded,
-                                size: 19,
-                                color: Colors.red.shade300,
-                              ),
-                              tooltip: 'Удалить изображение',
-                              constraints: const BoxConstraints(
-                                minWidth: 32,
-                                minHeight: 32,
-                              ),
-                              padding: const EdgeInsets.all(6),
-                              onPressed: _deleteImage,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                ],
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Center(
+        child: GestureDetector(
+          onSecondaryTapDown: (details) =>
+              _showContextMenu(details, imageSource, imageWidget),
+          onLongPressStart: (details) => _showContextMenu(
+            TapDownDetails(globalPosition: details.globalPosition),
+            imageSource,
+            imageWidget,
+          ),
+          onTap: () => _showLightbox(imageWidget, imageSource),
+          child: TweenAnimationBuilder<double>(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOutCubic,
+            tween: Tween(begin: 0.98, end: 1.0),
+            builder: (context, scale, child) {
+              return Transform.scale(
+                scale: scale,
+                child: child,
+              );
+            },
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 520),
+                child: imageWidget,
               ),
             ),
           ),
@@ -1522,7 +1676,9 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
 class NoteEditorView extends StatefulWidget {
   final Note note;
   final String vaultId;
-  final Function(String, String, String, String)? onNoteUpdated;
+  final bool isMobile;
+  final Function(String id, String title, String plainText, String content)?
+      onNoteUpdated;
   final VoidCallback? onDeleteRequested;
   final VoidCallback? onBroadcastSync;
 
@@ -1530,6 +1686,7 @@ class NoteEditorView extends StatefulWidget {
     super.key,
     required this.note,
     required this.vaultId,
+    this.isMobile = false,
     this.onNoteUpdated,
     this.onDeleteRequested,
     this.onBroadcastSync,
@@ -1539,9 +1696,11 @@ class NoteEditorView extends StatefulWidget {
   State<NoteEditorView> createState() => _NoteEditorViewState();
 }
 
-class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObserver {
+class _NoteEditorViewState extends State<NoteEditorView>
+    with WidgetsBindingObserver {
   late TextEditingController _titleController;
   late QuillController _quillController;
+  final FocusNode _editorFocusNode = FocusNode();
   StreamSubscription? _docChangeSub;
   Timer? _debounceTimer;
   bool _isInternalDocUpdate = false;
@@ -1553,9 +1712,14 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
   final ValueNotifier<bool> _isSavingNotifier = ValueNotifier(false);
   final ValueNotifier<bool> _isSavedNotifier = ValueNotifier(true);
 
+  // Floating selection toolbar state
+  bool _showFloatingToolbar = false;
+  // Slash menu state
+  bool _showSlashMenu = false;
+
   void _subscribeToDocChanges() {
     _docChangeSub?.cancel();
-    _docChangeSub = _quillController.document.changes.listen((_) {
+    _docChangeSub = _quillController.document.changes.listen((change) {
       if (!_isInternalDocUpdate) {
         _onContentChanged();
       }
@@ -1585,35 +1749,56 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
       clipboardConfig: QuillClipboardConfig(
         onImagePaste: (bytes) async {
           await _insertImageBytes(bytes);
-          return null; // Предотвращаем дублирование вставки библиотекой
+          return null;
         },
       ),
     );
 
+    Document doc;
     if (widget.note.content.isNotEmpty) {
       try {
         final decoded = jsonDecode(widget.note.content);
-        _quillController = QuillController(
-          document: Document.fromJson(decoded),
-          selection: const TextSelection.collapsed(offset: 0),
-          config: controllerConfig,
-        );
+        if (decoded is List) {
+          doc = Document.fromJson(decoded);
+        } else if (decoded is Map && decoded['delta'] is List) {
+          doc = Document.fromJson(decoded['delta']);
+        } else {
+          doc = Document();
+        }
       } catch (_) {
-        _quillController = QuillController.basic(config: controllerConfig);
+        doc = Document();
       }
     } else {
-      _quillController = QuillController.basic(config: controllerConfig);
+      doc = Document();
     }
+
+    _quillController = QuillController(
+      document: doc,
+      selection: const TextSelection.collapsed(offset: 0),
+      config: controllerConfig,
+    );
 
     _titleController.addListener(_onTitleChanged);
     _subscribeToDocChanges();
 
-    // Слушатель веб-события вставки изображения (Cmd+V в WKWebView)
+    _quillController.addListener(_handleSelectionChange);
+
     WebPasteListener.setHandler((bytes) {
       if (mounted) {
         _insertImageBytes(bytes);
       }
     });
+  }
+
+  void _handleSelectionChange() {
+    final selection = _quillController.selection;
+    final hasSelection = !selection.isCollapsed &&
+        selection.start >= 0 &&
+        selection.end > selection.start;
+
+    if (hasSelection != _showFloatingToolbar && mounted) {
+      setState(() => _showFloatingToolbar = hasSelection);
+    }
   }
 
   @override
@@ -1642,7 +1827,13 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
       if (widget.note.content.isNotEmpty) {
         try {
           final decoded = jsonDecode(widget.note.content);
-          newDoc = Document.fromJson(decoded);
+          if (decoded is List) {
+            newDoc = Document.fromJson(decoded);
+          } else if (decoded is Map && decoded['delta'] is List) {
+            newDoc = Document.fromJson(decoded['delta']);
+          } else {
+            newDoc = Document();
+          }
         } catch (_) {
           newDoc = Document();
         }
@@ -1669,8 +1860,6 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
         final msSinceLocalEdit =
             DateTime.now().difference(_lastLocalEditTime).inMilliseconds;
 
-        // Защита активной заметки: если вставляется картинка, есть несохраненные правки
-        // или пользователь печатал в последние 2 секунды — не перезаписываем редактор!
         if (_isInsertingImage ||
             hasPendingLocalChanges ||
             msSinceLocalEdit < 2000) {
@@ -1681,32 +1870,49 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
         _lastSavedContent = remoteContent;
         _isSavedNotifier.value = true;
 
-          if (titleChanged) {
-            _titleController.text = remoteTitle;
-          }
-          if (contentChanged && remoteContent.isNotEmpty) {
-            try {
-              final decoded = jsonDecode(remoteContent);
-              final newDoc = Document.fromJson(decoded);
-              final oldSelection = _quillController.selection;
-              _setQuillDocument(newDoc);
-              final newLen = _quillController.document.length;
-              final safeOffset = oldSelection.baseOffset.clamp(0, newLen - 1);
-              _quillController.updateSelection(
-                TextSelection.collapsed(offset: safeOffset),
-                ChangeSource.local,
-              );
-            } catch (_) {}
-          }
+        if (titleChanged) {
+          _titleController.text = remoteTitle;
+        }
+        if (contentChanged && remoteContent.isNotEmpty) {
+          try {
+            final decoded = jsonDecode(remoteContent);
+            Document newDoc;
+            if (decoded is List) {
+              newDoc = Document.fromJson(decoded);
+            } else if (decoded is Map && decoded['delta'] is List) {
+              newDoc = Document.fromJson(decoded['delta']);
+            } else {
+              newDoc = Document();
+            }
+            final oldSelection = _quillController.selection;
+            _setQuillDocument(newDoc);
+            final newLen = _quillController.document.length;
+            final safeOffset = oldSelection.baseOffset.clamp(0, newLen - 1);
+            _quillController.updateSelection(
+              TextSelection.collapsed(offset: safeOffset),
+              ChangeSource.local,
+            );
+          } catch (_) {}
         }
       }
     }
+  }
 
   void _onTitleChanged() {
     _scheduleSave();
   }
 
   void _onContentChanged() {
+    // Check if user typed '/' to show slash commands
+    final text = _quillController.document.toPlainText();
+    final sel = _quillController.selection.baseOffset;
+    if (sel > 0 && sel <= text.length && text[sel - 1] == '/') {
+      if (!_showSlashMenu) {
+        setState(() => _showSlashMenu = true);
+      }
+    } else if (_showSlashMenu) {
+      setState(() => _showSlashMenu = false);
+    }
     _scheduleSave();
   }
 
@@ -1719,14 +1925,27 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
 
   Future<void> _saveNote({bool force = false}) async {
     final title = _titleController.text.trim();
-    final content = jsonEncode(_quillController.document.toDelta().toJson());
+    final rawDelta = _quillController.document.toDelta().toJson();
 
-    // Защита: никогда не сохраняем временные data:image base64 строки в базу данных
-    if (content.contains('data:image/')) {
+    // Защита от сохранения data:image base64
+    final jsonString = jsonEncode(rawDelta);
+    if (jsonString.contains('data:image/')) {
       return;
     }
 
-    if (!force && title == _lastSavedTitle && content == _lastSavedContent) {
+    String contentToSave;
+    if (widget.note.isPinned) {
+      contentToSave = jsonEncode({
+        'delta': rawDelta,
+        'is_pinned': true,
+      });
+    } else {
+      contentToSave = jsonString;
+    }
+
+    if (!force &&
+        title == _lastSavedTitle &&
+        contentToSave == _lastSavedContent) {
       _isSavedNotifier.value = true;
       return;
     }
@@ -1735,20 +1954,19 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
 
     try {
       final plainText = _quillController.document.toPlainText().trim();
-
-      // Уведомляем сайдбар о сохранении новых данных
-      widget.onNoteUpdated?.call(widget.note.id, title, plainText, content);
+      widget.onNoteUpdated
+          ?.call(widget.note.id, title, plainText, contentToSave);
 
       await Supabase.instance.client.from('notes').upsert({
         'id': widget.note.id,
         'vault_id': widget.vaultId,
         'title': title,
-        'content': content,
+        'content': contentToSave,
         'plain_text': plainText,
         'updated_at': DateTime.now().toIso8601String(),
       });
       _lastSavedTitle = title;
-      _lastSavedContent = content;
+      _lastSavedContent = contentToSave;
       _isSavedNotifier.value = true;
       widget.onBroadcastSync?.call();
     } catch (e) {
@@ -1766,6 +1984,7 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
     _docChangeSub?.cancel();
     _saveNote();
     _titleController.dispose();
+    _editorFocusNode.dispose();
     _quillController.dispose();
     _isSavingNotifier.dispose();
     _isSavedNotifier.dispose();
@@ -1837,7 +2056,6 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
     }
     if (found) {
       _lastLocalEditTime = DateTime.now();
-
       final oldSelection = _quillController.selection;
       _setQuillDocument(Document.fromJson(jsonList));
       final maxOffset = _quillController.document.length - 1;
@@ -1866,13 +2084,10 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
           index < 0 ? _quillController.document.length - 1 : index;
       final safeLength = length < 0 ? 0 : length;
 
-      // 1. Быстрая оптимизация до компактного JPEG прямо в памяти
       final optimized = await _optimizeImageBytes(bytes);
-
       final tempBase64 = base64Encode(optimized);
       final localDataUrl = 'data:image/jpeg;base64,$tempBase64';
 
-      // Сохраняем байты в кэш для мгновенного плавного рендера
       AppImageCache.put(localDataUrl, optimized);
 
       _quillController.replaceText(
@@ -1886,19 +2101,15 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
         ChangeSource.local,
       );
 
-      // Отменяем таймер сохранения, чтобы временный Base64 НЕ улетал в базу данных!
       _debounceTimer?.cancel();
       _lastLocalEditTime = DateTime.now();
       _isSavedNotifier.value = false;
       _isSavingNotifier.value = true;
 
-      // 2. Фоновая отправка легковесных 150 КБ в Supabase Storage
       try {
         final cloudUrl = await _uploadImageToStorage(optimized);
         if (cloudUrl != null && mounted) {
-          // Кэшируем байты по cloudUrl ДО подмены в документе, чтобы не было мерцания
           AppImageCache.put(cloudUrl, optimized);
-          // Подменяем локальный base64 постоянным облачным URL
           _replaceImageSourceInDocument(localDataUrl, cloudUrl);
           await _saveNote(force: true);
         }
@@ -1924,6 +2135,29 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
     } catch (_) {}
   }
 
+  void _applyFormat(Attribute attribute) {
+    _quillController.formatSelection(attribute);
+  }
+
+  void _applySlashCommand(Attribute? attr, {bool isImage = false}) {
+    // Remove the '/' character
+    final sel = _quillController.selection.baseOffset;
+    if (sel > 0) {
+      _quillController.replaceText(sel - 1, 1, '', null);
+      _quillController.updateSelection(
+        TextSelection.collapsed(offset: sel - 1),
+        ChangeSource.local,
+      );
+    }
+    setState(() => _showSlashMenu = false);
+
+    if (isImage) {
+      _pickImage();
+    } else if (attr != null) {
+      _quillController.formatSelection(attr);
+    }
+  }
+
   void _copyNoteContent() {
     final title = _titleController.text.trim();
     final plainText = _quillController.document.toPlainText().trim();
@@ -1934,65 +2168,328 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
       SnackBar(
         content: const Row(
           children: [
-            Icon(Icons.check_circle, color: Colors.white, size: 18),
+            Icon(Icons.check_circle_rounded, color: Colors.white, size: 16),
             SizedBox(width: 8),
-            Text('Текст заметки скопирован в буфер обмена'),
+            Text('Текст заметки скопирован'),
           ],
         ),
-        backgroundColor: Colors.green.shade700,
+        backgroundColor: const Color(0xFF10B981),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(seconds: 2),
       ),
     );
   }
 
-  Widget _buildSaveIndicator(bool isDark) {
-    return ValueListenableBuilder<bool>(
-      valueListenable: _isSavingNotifier,
-      builder: (context, isSaving, _) {
-        if (isSaving) {
-          return Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(
-                width: 12,
-                height: 12,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-              const SizedBox(width: 6),
-              Text(
-                'Сохранение...',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: isDark ? Colors.white38 : Colors.black45,
-                ),
-              ),
-            ],
-          );
-        }
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
 
+    return Stack(
+      children: [
+        // Main Editor Canvas
+        GestureDetector(
+          onTap: () {
+            if (!_editorFocusNode.hasFocus) {
+              _editorFocusNode.requestFocus();
+            }
+          },
+          behavior: HitTestBehavior.translucent,
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(
+                parent: BouncingScrollPhysics()),
+            padding: EdgeInsets.symmetric(
+              horizontal: widget.isMobile ? 20 : 36,
+              vertical: widget.isMobile ? 16 : 28,
+            ),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 680),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Top header: Minimal title and status dot
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _titleController,
+                            style: TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.w700,
+                              height: 1.25,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            maxLines: null,
+                            decoration: InputDecoration(
+                              hintText: 'Заголовок заметки',
+                              hintStyle: TextStyle(
+                                fontSize: 28,
+                                fontWeight: FontWeight.w700,
+                                height: 1.25,
+                                color: theme.colorScheme.onSurfaceVariant
+                                    .withAlpha(120),
+                              ),
+                              border: InputBorder.none,
+                              isDense: true,
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        // Micro status indicator dot
+                        _buildStatusDot(),
+                      ],
+                    ),
+                    const SizedBox(height: 24),
+
+                    // Quill Editor Canvas
+                    QuillEditor(
+                      controller: _quillController,
+                      focusNode: _editorFocusNode,
+                      scrollController: ScrollController(),
+                      config: QuillEditorConfig(
+                        autoFocus: false,
+                        expands: false,
+                        padding: EdgeInsets.zero,
+                        showCursor: true,
+                        detectWordBoundary: false,
+                        embedBuilders: [
+                          AppImageEmbedBuilder(
+                            onDeleteImage: (src) {
+                              _replaceImageSourceInDocument(src, '');
+                              _saveNote(force: true);
+                            },
+                          ),
+                        ],
+                        customStyles: DefaultStyles(
+                          paragraph: DefaultTextBlockStyle(
+                            TextStyle(
+                              fontSize: 16,
+                              height: 1.7,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            const HorizontalSpacing(0, 0),
+                            const VerticalSpacing(0, 4),
+                            const VerticalSpacing(0, 0),
+                            null,
+                          ),
+                          h1: DefaultTextBlockStyle(
+                            TextStyle(
+                              fontSize: 24,
+                              fontWeight: FontWeight.w700,
+                              height: 1.4,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            const HorizontalSpacing(0, 0),
+                            const VerticalSpacing(16, 6),
+                            const VerticalSpacing(0, 0),
+                            null,
+                          ),
+                          h2: DefaultTextBlockStyle(
+                            TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w700,
+                              height: 1.4,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            const HorizontalSpacing(0, 0),
+                            const VerticalSpacing(14, 4),
+                            const VerticalSpacing(0, 0),
+                            null,
+                          ),
+                          code: DefaultTextBlockStyle(
+                            TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 13,
+                              color: isDark
+                                  ? const Color(0xFFE2E8F0)
+                                  : const Color(0xFF1E293B),
+                            ),
+                            const HorizontalSpacing(0, 0),
+                            const VerticalSpacing(8, 8),
+                            const VerticalSpacing(0, 0),
+                            BoxDecoration(
+                              color: isDark
+                                  ? const Color(0xFF16181D)
+                                  : const Color(0xFFF1F3F5),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                          ),
+                          quote: DefaultTextBlockStyle(
+                            TextStyle(
+                              fontSize: 15,
+                              fontStyle: FontStyle.italic,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                            const HorizontalSpacing(0, 0),
+                            const VerticalSpacing(6, 6),
+                            const VerticalSpacing(0, 0),
+                            BoxDecoration(
+                              border: Border(
+                                left: BorderSide(
+                                  color: theme.colorScheme.primary,
+                                  width: 3,
+                                ),
+                              ),
+                            ),
+                          ),
+                          placeHolder: DefaultTextBlockStyle(
+                            TextStyle(
+                              fontSize: 16,
+                              height: 1.7,
+                              color: theme.colorScheme.onSurfaceVariant
+                                  .withAlpha(120),
+                            ),
+                            const HorizontalSpacing(0, 0),
+                            const VerticalSpacing(0, 0),
+                            const VerticalSpacing(0, 0),
+                            null,
+                          ),
+                        ),
+                        placeholder:
+                            'Начните писать или нажмите / для выбора команд...',
+                      ),
+                    ),
+                    const SizedBox(height: 120),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+
+        // Floating Selection Toolbar Capsule (Desktop)
+        if (_showFloatingToolbar && !widget.isMobile)
+          Positioned(
+            top: 24,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: _buildFloatingSelectionCapsule(),
+            ),
+          ),
+
+        // Slash command menu
+        if (_showSlashMenu)
+          Positioned(
+            top: 80,
+            left: MediaQuery.sizeOf(context).width > 720
+                ? (MediaQuery.sizeOf(context).width - 270) / 2 - 130
+                : 30,
+            child: _buildSlashCommandMenu(),
+          ),
+
+        // Mobile Bottom Keyboard Strip
+        if (widget.isMobile)
+          Positioned(
+            bottom: MediaQuery.viewInsetsOf(context).bottom + 8,
+            left: 16,
+            right: 16,
+            child: _buildMobileToolbarStrip(),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildStatusDot() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: _isSavedNotifier,
+      builder: (context, isSaved, _) {
         return ValueListenableBuilder<bool>(
-          valueListenable: _isSavedNotifier,
-          builder: (context, isSaved, _) {
-            return Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  isSaved ? Icons.check_circle_outline : Icons.edit,
-                  size: 14,
-                  color: isSaved
-                      ? Colors.green.withAlpha(200)
-                      : (isDark ? Colors.white38 : Colors.black45),
-                ),
-                const SizedBox(width: 4),
-                Text(
-                  isSaved ? 'Сохранено' : 'Не сохранено',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: isDark ? Colors.white38 : Colors.black45,
+          valueListenable: _isSavingNotifier,
+          builder: (context, isSaving, _) {
+            final isSynced = isSaved && !isSaving;
+            final dotColor =
+                isSynced ? const Color(0xFF10B981) : const Color(0xFFF59E0B);
+
+            return Tooltip(
+              message: isSynced ? 'Сохранено' : 'Синхронизация...',
+              waitDuration: const Duration(milliseconds: 200),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 250),
+                    curve: Curves.easeOutCubic,
+                    width: 7,
+                    height: 7,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: dotColor,
+                      boxShadow: [
+                        BoxShadow(
+                          color: dotColor.withAlpha(isSynced ? 80 : 160),
+                          blurRadius: 6,
+                          spreadRadius: 1,
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                  const SizedBox(width: 8),
+                  PopupMenuButton<String>(
+                    icon: Icon(
+                      Icons.more_horiz_rounded,
+                      size: 18,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12)),
+                    color: Theme.of(context).brightness == Brightness.dark
+                        ? const Color(0xFF1E2026)
+                        : Colors.white,
+                    itemBuilder: (ctx) => [
+                      const PopupMenuItem(
+                        value: 'copy',
+                        height: 36,
+                        child: Row(
+                          children: [
+                            Icon(Icons.copy_rounded, size: 16),
+                            SizedBox(width: 8),
+                            Text('Скопировать весь текст',
+                                style: TextStyle(fontSize: 13)),
+                          ],
+                        ),
+                      ),
+                      const PopupMenuItem(
+                        value: 'image',
+                        height: 36,
+                        child: Row(
+                          children: [
+                            Icon(Icons.image_outlined, size: 16),
+                            SizedBox(width: 8),
+                            Text('Вставить фото',
+                                style: TextStyle(fontSize: 13)),
+                          ],
+                        ),
+                      ),
+                      const PopupMenuDivider(height: 1),
+                      PopupMenuItem(
+                        value: 'delete',
+                        height: 36,
+                        child: Row(
+                          children: [
+                            Icon(Icons.delete_outline_rounded,
+                                size: 16, color: Colors.red.shade400),
+                            const SizedBox(width: 8),
+                            Text(
+                              'Удалить заметку',
+                              style: TextStyle(
+                                  fontSize: 13, color: Colors.red.shade400),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                    onSelected: (val) {
+                      if (val == 'copy') _copyNoteContent();
+                      if (val == 'image') _pickImage();
+                      if (val == 'delete') widget.onDeleteRequested?.call();
+                    },
+                  ),
+                ],
+              ),
             );
           },
         );
@@ -2000,224 +2497,266 @@ class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObse
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
+  Widget _buildFloatingSelectionCapsule() {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final isDesktop = MediaQuery.of(context).size.width >= 720;
 
-    final headerWidget = isDesktop
-        ? Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _titleController,
-                  style: TextStyle(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: -0.4,
-                    color: isDark ? Colors.white : const Color(0xFF0F172A),
-                  ),
-                  decoration: InputDecoration(
-                    hintText: 'Заголовок заметки',
-                    hintStyle: TextStyle(
-                      color: isDark ? Colors.white24 : Colors.black26,
-                      fontWeight: FontWeight.w600,
-                    ),
-                    border: InputBorder.none,
-                    isDense: true,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                ),
-              ),
-              _buildSaveIndicator(isDark),
-              const SizedBox(width: 12),
-              IconButton(
-                icon: const Icon(Icons.copy_rounded, size: 20),
-                tooltip: 'Скопировать весь текст заметки',
-                onPressed: _copyNoteContent,
-              ),
-              IconButton(
-                icon: const Icon(Icons.add_photo_alternate_outlined, size: 21),
-                tooltip: 'Вставить изображение',
-                onPressed: _pickImage,
-              ),
-              if (widget.onDeleteRequested != null)
-                IconButton(
-                  icon: Icon(
-                    Icons.delete_outline,
-                    size: 21,
-                    color: Colors.red.withAlpha(190),
-                  ),
-                  tooltip: 'Удалить заметку',
-                  onPressed: widget.onDeleteRequested,
-                ),
-            ],
-          )
-        : Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              TextField(
-                controller: _titleController,
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: -0.3,
-                  color: isDark ? Colors.white : const Color(0xFF0F172A),
-                ),
-                decoration: InputDecoration(
-                  hintText: 'Заголовок заметки',
-                  hintStyle: TextStyle(
-                    color: isDark ? Colors.white24 : Colors.black26,
-                    fontWeight: FontWeight.w600,
-                  ),
-                  border: InputBorder.none,
-                  isDense: true,
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  _buildSaveIndicator(isDark),
-                  const Spacer(),
-                  IconButton(
-                    icon: const Icon(Icons.copy_rounded, size: 20),
-                    tooltip: 'Скопировать весь текст заметки',
-                    visualDensity: VisualDensity.compact,
-                    onPressed: _copyNoteContent,
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.add_photo_alternate_outlined, size: 21),
-                    tooltip: 'Вставить изображение',
-                    visualDensity: VisualDensity.compact,
-                    onPressed: _pickImage,
-                  ),
-                  if (widget.onDeleteRequested != null)
-                    IconButton(
-                      icon: Icon(
-                        Icons.delete_outline,
-                        size: 21,
-                        color: Colors.red.withAlpha(190),
-                      ),
-                      tooltip: 'Удалить заметку',
-                      visualDensity: VisualDensity.compact,
-                      onPressed: widget.onDeleteRequested,
-                    ),
-                ],
-              ),
-            ],
-          );
-
-    return Column(
-      children: [
-        // Верхняя панель заметки (Заголовок, статус сохранения, действия)
-        Padding(
-          padding: EdgeInsets.fromLTRB(
-            isDesktop ? 28 : 16,
-            isDesktop ? 16 : 10,
-            isDesktop ? 24 : 12,
-            isDesktop ? 8 : 4,
-          ),
-          child: headerWidget,
-        ),
-
-        // Панель форматирования текста (Toolbar)
-        Container(
-          margin: EdgeInsets.symmetric(
-            horizontal: isDesktop ? 24 : 12,
-            vertical: 4,
-          ),
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(24),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
           decoration: BoxDecoration(
             color: isDark
-                ? const Color(0xFF1E1E24)
-                : const Color(0xFFF1F5F9),
-            borderRadius: BorderRadius.circular(10),
-          ),
-          child: QuillSimpleToolbar(
-            controller: _quillController,
-            config: const QuillSimpleToolbarConfig(
-              multiRowsDisplay: false,
-              showFontFamily: false,
-              showFontSize: false,
-              showColorButton: false,
-              showBackgroundColorButton: false,
-              showSubscript: false,
-              showSuperscript: false,
-              showSearchButton: false,
-              showInlineCode: true,
-              showCodeBlock: true,
-              showAlignmentButtons: false,
-              showDirection: false,
-              showLink: false,
-              showListCheck: true,
-              showListBullets: true,
-              showListNumbers: true,
-              showQuote: true,
-              showIndent: false,
-              showClearFormat: true,
-              buttonOptions: QuillSimpleToolbarButtonOptions(
-                base: QuillToolbarBaseButtonOptions(
-                  iconSize: 18,
-                ),
-              ),
+                ? Colors.black.withAlpha(200)
+                : Colors.white.withAlpha(220),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(
+              color: isDark
+                  ? Colors.white.withAlpha(30)
+                  : Colors.black.withAlpha(20),
             ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withAlpha(isDark ? 80 : 25),
+                blurRadius: 20,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _toolbarBtn(
+                label: 'B',
+                style: const TextStyle(fontWeight: FontWeight.w800),
+                onTap: () => _applyFormat(Attribute.bold),
+              ),
+              _toolbarBtn(
+                label: 'I',
+                style: const TextStyle(fontStyle: FontStyle.italic),
+                onTap: () => _applyFormat(Attribute.italic),
+              ),
+              _toolbarBtn(
+                label: 'S',
+                style: const TextStyle(decoration: TextDecoration.lineThrough),
+                onTap: () => _applyFormat(Attribute.strikeThrough),
+              ),
+              _divider(),
+              _toolbarBtn(
+                label: 'H1',
+                style: const TextStyle(fontWeight: FontWeight.w700),
+                onTap: () => _applyFormat(Attribute.h1),
+              ),
+              _toolbarBtn(
+                label: 'H2',
+                style: const TextStyle(fontWeight: FontWeight.w700),
+                onTap: () => _applyFormat(Attribute.h2),
+              ),
+              _divider(),
+              _toolbarBtn(
+                icon: Icons.format_list_bulleted_rounded,
+                onTap: () => _applyFormat(Attribute.ul),
+              ),
+              _toolbarBtn(
+                icon: Icons.check_box_outlined,
+                onTap: () => _applyFormat(Attribute.unchecked),
+              ),
+              _toolbarBtn(
+                icon: Icons.code_rounded,
+                onTap: () => _applyFormat(Attribute.codeBlock),
+              ),
+            ],
           ),
         ),
+      ),
+    );
+  }
 
-        // Поле текстового редактора
-        Expanded(
-          child: Padding(
-            padding: EdgeInsets.fromLTRB(
-              isDesktop ? 28 : 16,
-              isDesktop ? 12 : 8,
-              isDesktop ? 28 : 16,
-              16,
+  Widget _buildSlashCommandMenu() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        width: 240,
+        decoration: BoxDecoration(
+          color: isDark ? const Color(0xFF1A1C22) : Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: isDark
+                ? Colors.white.withAlpha(25)
+                : Colors.black.withAlpha(15),
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withAlpha(isDark ? 90 : 25),
+              blurRadius: 24,
+              offset: const Offset(0, 10),
             ),
-            child: QuillEditor.basic(
-              controller: _quillController,
-              config: QuillEditorConfig(
-                placeholder: isDesktop
-                    ? 'Начните писать или вставьте текст / скриншот (⌘V)...'
-                    : 'Начните писать заметку...',
-                expands: true,
-                scrollable: true,
-                detectWordBoundary: false,
-                scrollBottomInset: 60,
-                customStyles: DefaultStyles(
-                  paragraph: DefaultTextBlockStyle(
-                    TextStyle(
-                      fontSize: 16,
-                      height: 1.45,
-                      color: isDark
-                          ? const Color(0xFFF4F4F5)
-                          : const Color(0xFF0F172A),
-                    ),
-                    const HorizontalSpacing(0, 0),
-                    const VerticalSpacing(3, 3),
-                    VerticalSpacing.zero,
-                    null,
-                  ),
-                  placeHolder: DefaultTextBlockStyle(
-                    TextStyle(
-                      fontSize: 16,
-                      height: 1.45,
-                      color: isDark ? Colors.white24 : Colors.black26,
-                    ),
-                    const HorizontalSpacing(0, 0),
-                    const VerticalSpacing(3, 3),
-                    VerticalSpacing.zero,
-                    null,
-                  ),
-                ),
-                embedBuilders: const [
-                  AppImageEmbedBuilder(),
-                ],
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _slashItem(
+                  icon: Icons.title_rounded,
+                  title: 'Заголовок H1',
+                  onTap: () => _applySlashCommand(Attribute.h1)),
+              _slashItem(
+                  icon: Icons.format_size_rounded,
+                  title: 'Подзаголовок H2',
+                  onTap: () => _applySlashCommand(Attribute.h2)),
+              _slashItem(
+                  icon: Icons.check_box_outlined,
+                  title: 'Список задач',
+                  onTap: () => _applySlashCommand(Attribute.unchecked)),
+              _slashItem(
+                  icon: Icons.format_list_bulleted_rounded,
+                  title: 'Маркированный список',
+                  onTap: () => _applySlashCommand(Attribute.ul)),
+              _slashItem(
+                  icon: Icons.code_rounded,
+                  title: 'Блок кода',
+                  onTap: () => _applySlashCommand(Attribute.codeBlock)),
+              _slashItem(
+                  icon: Icons.format_quote_rounded,
+                  title: 'Цитата',
+                  onTap: () => _applySlashCommand(Attribute.blockQuote)),
+              _slashItem(
+                  icon: Icons.image_outlined,
+                  title: 'Вставить изображение',
+                  onTap: () => _applySlashCommand(null, isImage: true)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _slashItem({
+    required IconData icon,
+    required String title,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        child: Row(
+          children: [
+            Icon(icon, size: 16, color: const Color(0xFF6366F1)),
+            const SizedBox(width: 10),
+            Text(
+              title,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                color: Theme.of(context).colorScheme.onSurface,
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMobileToolbarStrip() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Center(
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: isDark
+                  ? Colors.black.withAlpha(190)
+                  : Colors.white.withAlpha(220),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: isDark
+                    ? Colors.white.withAlpha(25)
+                    : Colors.black.withAlpha(15),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withAlpha(isDark ? 80 : 25),
+                  blurRadius: 16,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.image_outlined, size: 20),
+                  onPressed: _pickImage,
+                  splashRadius: 18,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.check_box_outlined, size: 20),
+                  onPressed: () => _applyFormat(Attribute.unchecked),
+                  splashRadius: 18,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.title_rounded, size: 20),
+                  onPressed: () => _applyFormat(Attribute.h1),
+                  splashRadius: 18,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.format_bold_rounded, size: 20),
+                  onPressed: () => _applyFormat(Attribute.bold),
+                  splashRadius: 18,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.keyboard_hide_rounded, size: 20),
+                  onPressed: () => FocusScope.of(context).unfocus(),
+                  splashRadius: 18,
+                ),
+              ],
             ),
           ),
         ),
-      ],
+      ),
+    );
+  }
+
+  Widget _toolbarBtn({
+    String? label,
+    IconData? icon,
+    TextStyle? style,
+    required VoidCallback onTap,
+  }) {
+    final theme = Theme.of(context);
+    return BouncingPressable(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: icon != null
+            ? Icon(icon, size: 16, color: theme.colorScheme.onSurface)
+            : Text(
+                label ?? '',
+                style: (style ?? const TextStyle()).copyWith(
+                  fontSize: 13,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
+      ),
+    );
+  }
+
+  Widget _divider() {
+    return Container(
+      width: 1,
+      height: 16,
+      margin: const EdgeInsets.symmetric(horizontal: 4),
+      color: Theme.of(context).dividerColor.withAlpha(60),
     );
   }
 }
