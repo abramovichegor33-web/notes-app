@@ -26,11 +26,28 @@
       e.preventDefault();
     }, true);
 
-    // Мост для прямого копирования картинок в системный буфер обмена macOS (NSPasteboard)
+    // Мост для прямого копирования картинок в системный буфер обмена (macOS NSPasteboard и Windows Clipboard)
     window.copyImageToClipboard = function(base64Data) {
       try {
         if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.copyImageToClipboard) {
           window.webkit.messageHandlers.copyImageToClipboard.postMessage(base64Data);
+          return true;
+        }
+        if (navigator.clipboard && window.ClipboardItem) {
+          var clean = base64Data.indexOf(',') !== -1 ? base64Data.split(',')[1] : base64Data;
+          var binary = atob(clean);
+          var bytes = new Uint8Array(binary.length);
+          for (var i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          var mime = 'image/png';
+          if (base64Data.indexOf('data:image/jpeg') !== -1) mime = 'image/jpeg';
+          var blob = new Blob([bytes], { type: mime });
+          var item = {};
+          item[mime] = blob;
+          navigator.clipboard.write([new ClipboardItem(item)]).catch(function(err) {
+            console.error('navigator.clipboard.write error:', err);
+          });
           return true;
         }
       } catch (err) {
