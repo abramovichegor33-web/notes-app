@@ -2126,11 +2126,16 @@ class _NoteEditorViewState extends State<NoteEditorView>
   void _replaceImageSourceInDocument(String oldSource, String newSource) {
     final jsonList = _quillController.document.toDelta().toJson();
     bool found = false;
-    for (final item in jsonList) {
-      final insert = item['insert'];
+    for (int i = 0; i < jsonList.length; i++) {
+      final insert = jsonList[i]['insert'];
       if (insert is Map && insert['image'] == oldSource) {
-        insert['image'] = newSource;
+        if (newSource.isEmpty) {
+          jsonList.removeAt(i);
+        } else {
+          insert['image'] = newSource;
+        }
         found = true;
+        break;
       }
     }
     if (found) {
@@ -2169,14 +2174,35 @@ class _NoteEditorViewState extends State<NoteEditorView>
 
       AppImageCache.put(localDataUrl, optimized);
 
+      final plainText = _quillController.document.toPlainText();
+      final needsLeadingNewline = safeIndex > 0 &&
+          safeIndex <= plainText.length &&
+          plainText[safeIndex - 1] != '\n';
+
+      int currentPos = safeIndex;
+
+      // Newline before image if not already at line start
+      if (needsLeadingNewline) {
+        _quillController.replaceText(currentPos, 0, '\n', null);
+        currentPos += 1;
+      }
+
+      // Insert image block
       _quillController.replaceText(
-        safeIndex,
+        currentPos,
         safeLength,
         BlockEmbed.image(localDataUrl),
         null,
       );
+      currentPos += 1;
+
+      // Always insert newline after the image so cursor jumps to the next line below
+      _quillController.replaceText(currentPos, 0, '\n', null);
+      currentPos += 1;
+
+      // Place cursor neatly on the fresh new line below the image
       _quillController.updateSelection(
-        TextSelection.collapsed(offset: safeIndex + 1),
+        TextSelection.collapsed(offset: currentPos),
         ChangeSource.local,
       );
 
