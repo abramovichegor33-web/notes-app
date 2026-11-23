@@ -71,6 +71,11 @@ class _NotesAppState extends State<NotesApp> {
           outlineVariant: const Color(0xFFE2E8F0),
         ),
         dividerColor: const Color(0xFFE2E8F0),
+        textSelectionTheme: const TextSelectionThemeData(
+          cursorColor: accentColor,
+          selectionColor: Color(0x4D6366F1),
+          selectionHandleColor: accentColor,
+        ),
         useMaterial3: true,
       ),
       darkTheme: ThemeData(
@@ -84,6 +89,11 @@ class _NotesAppState extends State<NotesApp> {
           outlineVariant: Color(0xFF2D2D34),
         ),
         dividerColor: const Color(0xFF27272E),
+        textSelectionTheme: const TextSelectionThemeData(
+          cursorColor: Color(0xFF818CF8),
+          selectionColor: Color(0x55818CF8),
+          selectionHandleColor: Color(0xFF818CF8),
+        ),
         useMaterial3: true,
       ),
       themeMode: ThemeMode.system,

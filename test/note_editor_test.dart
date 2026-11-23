@@ -41,7 +41,7 @@ void main() {
       ),
     );
 
-    await tester.pump();
+    await tester.pumpAndSettle();
     expect(find.text('фывфвф'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
@@ -87,7 +87,7 @@ void main() {
       ),
     );
 
-    await tester.pump();
+    await tester.pumpAndSettle();
     expect(find.text('Image Note'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });

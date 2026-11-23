@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_quill/flutter_quill.dart';
@@ -1101,23 +1102,32 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
   Future<void> _handleCopyImage(String imageSource) async {
     try {
       Uint8List? bytes;
-      if (imageSource.startsWith('data:image/') ||
-          imageSource.contains('base64')) {
-        final base64String =
-            imageSource.contains(',') ? imageSource.split(',')[1] : imageSource;
-        bytes = base64Decode(base64String);
-      } else if (imageSource.startsWith('http://') ||
-          imageSource.startsWith('https://')) {
-        final res = await http.get(Uri.parse(imageSource));
-        if (res.statusCode == 200) {
-          bytes = res.bodyBytes;
+      if (AppImageCache.has(imageSource)) {
+        bytes = AppImageCache.get(imageSource);
+      }
+      if (bytes == null || bytes.isEmpty) {
+        if (imageSource.startsWith('data:image/') ||
+            imageSource.contains('base64')) {
+          final base64String =
+              imageSource.contains(',') ? imageSource.split(',')[1] : imageSource;
+          bytes = base64Decode(base64String);
+        } else if (imageSource.startsWith('http://') ||
+            imageSource.startsWith('https://')) {
+          final res = await http.get(Uri.parse(imageSource));
+          if (res.statusCode == 200) {
+            bytes = res.bodyBytes;
+          }
         }
       }
 
       if (bytes != null && bytes.isNotEmpty) {
-        final base64Str = base64Encode(bytes);
-        copyImageViaNativeBridge(base64Str);
-        await Pasteboard.writeImage(bytes);
+        if (kIsWeb) {
+          final base64Str = base64Encode(bytes);
+          copyImageViaNativeBridge(base64Str);
+        } else {
+          await Pasteboard.writeImage(bytes);
+        }
+
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -1140,11 +1150,10 @@ class _AppImageItemWidgetState extends State<_AppImageItemWidget> {
       debugPrint('Error copying image: $e');
     }
 
-    Clipboard.setData(ClipboardData(text: imageSource));
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Ссылка на изображение скопирована'),
+          content: Text('Не удалось скопировать изображение'),
           behavior: SnackBarBehavior.floating,
           duration: Duration(seconds: 2),
         ),
@@ -1909,16 +1918,67 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     );
   }
 
+  Widget _buildSaveIndicator(bool isDark) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: _isSavingNotifier,
+      builder: (context, isSaving, _) {
+        if (isSaving) {
+          return Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                'Сохранение...',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: isDark ? Colors.white38 : Colors.black45,
+                ),
+              ),
+            ],
+          );
+        }
+
+        return ValueListenableBuilder<bool>(
+          valueListenable: _isSavedNotifier,
+          builder: (context, isSaved, _) {
+            return Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  isSaved ? Icons.check_circle_outline : Icons.edit,
+                  size: 14,
+                  color: isSaved
+                      ? Colors.green.withAlpha(200)
+                      : (isDark ? Colors.white38 : Colors.black45),
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  isSaved ? 'Сохранено' : 'Не сохранено',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: isDark ? Colors.white38 : Colors.black45,
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final isDesktop = MediaQuery.of(context).size.width >= 720;
 
-    return Column(
-      children: [
-        // Верхняя панель заметки (Заголовок, статус сохранения, действия)
-        Padding(
-          padding: const EdgeInsets.fromLTRB(28, 16, 24, 8),
-          child: Row(
+    final headerWidget = isDesktop
+        ? Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               Expanded(
@@ -1942,76 +2002,18 @@ class _NoteEditorViewState extends State<NoteEditorView> {
                   ),
                 ),
               ),
-
-              // Индикатор статуса сохранения
-              ValueListenableBuilder<bool>(
-                valueListenable: _isSavingNotifier,
-                builder: (context, isSaving, _) {
-                  if (isSaving) {
-                    return Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const SizedBox(
-                          width: 12,
-                          height: 12,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          'Сохранение...',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: isDark ? Colors.white38 : Colors.black45,
-                          ),
-                        ),
-                      ],
-                    );
-                  }
-
-                  return ValueListenableBuilder<bool>(
-                    valueListenable: _isSavedNotifier,
-                    builder: (context, isSaved, _) {
-                      return Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            isSaved ? Icons.check_circle_outline : Icons.edit,
-                            size: 14,
-                            color: isSaved
-                                ? Colors.green.withAlpha(200)
-                                : (isDark ? Colors.white38 : Colors.black45),
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
-                            isSaved ? 'Сохранено' : 'Не сохранено',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: isDark ? Colors.white38 : Colors.black45,
-                            ),
-                          ),
-                        ],
-                      );
-                    },
-                  );
-                },
-              ),
+              _buildSaveIndicator(isDark),
               const SizedBox(width: 12),
-
-              // Кнопка копирования всей заметки
               IconButton(
                 icon: const Icon(Icons.copy_rounded, size: 20),
                 tooltip: 'Скопировать весь текст заметки',
                 onPressed: _copyNoteContent,
               ),
-
-              // Кнопка вставки картинки
               IconButton(
                 icon: const Icon(Icons.add_photo_alternate_outlined, size: 21),
                 tooltip: 'Вставить изображение',
                 onPressed: _pickImage,
               ),
-
-              // Кнопка удаления заметки
               if (widget.onDeleteRequested != null)
                 IconButton(
                   icon: Icon(
@@ -2023,12 +2025,81 @@ class _NoteEditorViewState extends State<NoteEditorView> {
                   onPressed: widget.onDeleteRequested,
                 ),
             ],
+          )
+        : Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: _titleController,
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: -0.3,
+                  color: isDark ? Colors.white : const Color(0xFF0F172A),
+                ),
+                decoration: InputDecoration(
+                  hintText: 'Заголовок заметки',
+                  hintStyle: TextStyle(
+                    color: isDark ? Colors.white24 : Colors.black26,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  border: InputBorder.none,
+                  isDense: true,
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  _buildSaveIndicator(isDark),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.copy_rounded, size: 20),
+                    tooltip: 'Скопировать весь текст заметки',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: _copyNoteContent,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.add_photo_alternate_outlined, size: 21),
+                    tooltip: 'Вставить изображение',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: _pickImage,
+                  ),
+                  if (widget.onDeleteRequested != null)
+                    IconButton(
+                      icon: Icon(
+                        Icons.delete_outline,
+                        size: 21,
+                        color: Colors.red.withAlpha(190),
+                      ),
+                      tooltip: 'Удалить заметку',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: widget.onDeleteRequested,
+                    ),
+                ],
+              ),
+            ],
+          );
+
+    return Column(
+      children: [
+        // Верхняя панель заметки (Заголовок, статус сохранения, действия)
+        Padding(
+          padding: EdgeInsets.fromLTRB(
+            isDesktop ? 28 : 16,
+            isDesktop ? 16 : 10,
+            isDesktop ? 24 : 12,
+            isDesktop ? 8 : 4,
           ),
+          child: headerWidget,
         ),
 
         // Панель форматирования текста (Toolbar)
         Container(
-          margin: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
+          margin: EdgeInsets.symmetric(
+            horizontal: isDesktop ? 24 : 12,
+            vertical: 4,
+          ),
           decoration: BoxDecoration(
             color: isDark
                 ? const Color(0xFF1E1E24)
@@ -2038,6 +2109,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
           child: QuillSimpleToolbar(
             controller: _quillController,
             config: const QuillSimpleToolbarConfig(
+              multiRowsDisplay: false,
               showFontFamily: false,
               showFontSize: false,
               showColorButton: false,
@@ -2068,13 +2140,49 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         // Поле текстового редактора
         Expanded(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(28, 12, 28, 16),
+            padding: EdgeInsets.fromLTRB(
+              isDesktop ? 28 : 16,
+              isDesktop ? 12 : 8,
+              isDesktop ? 28 : 16,
+              16,
+            ),
             child: QuillEditor.basic(
               controller: _quillController,
-              config: const QuillEditorConfig(
-                placeholder:
-                    'Начните писать или вставьте текст / скриншот (⌘V)...',
-                embedBuilders: [
+              config: QuillEditorConfig(
+                placeholder: isDesktop
+                    ? 'Начните писать или вставьте текст / скриншот (⌘V)...'
+                    : 'Начните писать заметку...',
+                expands: true,
+                scrollable: true,
+                detectWordBoundary: false,
+                scrollBottomInset: 60,
+                customStyles: DefaultStyles(
+                  paragraph: DefaultTextBlockStyle(
+                    TextStyle(
+                      fontSize: 16,
+                      height: 1.45,
+                      color: isDark
+                          ? const Color(0xFFF4F4F5)
+                          : const Color(0xFF0F172A),
+                    ),
+                    const HorizontalSpacing(0, 0),
+                    const VerticalSpacing(3, 3),
+                    VerticalSpacing.zero,
+                    null,
+                  ),
+                  placeHolder: DefaultTextBlockStyle(
+                    TextStyle(
+                      fontSize: 16,
+                      height: 1.45,
+                      color: isDark ? Colors.white24 : Colors.black26,
+                    ),
+                    const HorizontalSpacing(0, 0),
+                    const VerticalSpacing(3, 3),
+                    VerticalSpacing.zero,
+                    null,
+                  ),
+                ),
+                embedBuilders: const [
                   AppImageEmbedBuilder(),
                 ],
               ),
