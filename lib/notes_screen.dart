@@ -10,6 +10,7 @@ import 'package:flutter_quill/flutter_quill.dart';
 import 'package:image/image.dart' as img;
 import 'package:pasteboard/pasteboard.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'main.dart';
 import 'note_model.dart';
@@ -37,6 +38,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   final ValueNotifier<List<Note>> _notesNotifier =
       ValueNotifier<List<Note>>([]);
   List<Note> _notes = [];
+  Set<String> _pinnedNoteIds = {};
   bool _isLoading = true;
   String _searchQuery = '';
   Note? _selectedNote;
@@ -49,9 +51,20 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     WebPasteListener.setNewNoteHandler(_createNewNote);
+    _loadPinnedNotes();
     _fetchNotes();
     _setupRealtime();
     _startPeriodicSync();
+  }
+
+  Future<void> _loadPinnedNotes() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final list = prefs.getStringList('pinned_${widget.vaultId}') ?? [];
+      if (mounted) {
+        setState(() => _pinnedNoteIds = list.toSet());
+      }
+    } catch (_) {}
   }
 
   @override
@@ -64,7 +77,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
 
   void _startPeriodicSync() {
     _periodicSyncTimer?.cancel();
-    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 4), (_) {
+    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       _syncFromCloudSilently();
     });
   }
@@ -79,6 +92,50 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
         },
       );
     } catch (_) {}
+  }
+
+  void _onRemoteSyncSignal() {
+    _incomingSyncDebounce?.cancel();
+    _incomingSyncDebounce = Timer(const Duration(milliseconds: 250), () {
+      if (mounted) {
+        _syncFromCloudSilently();
+      }
+    });
+  }
+
+  void _setupRealtime() {
+    _realtimeChannel?.unsubscribe();
+    _realtimeChannel = Supabase.instance.client
+        .channel('notes_vault_${widget.vaultId}')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'notes',
+          callback: (_) {
+            _onRemoteSyncSignal();
+          },
+        )
+        .onBroadcast(
+          event: 'sync',
+          callback: (_) {
+            _onRemoteSyncSignal();
+          },
+        )
+        .onBroadcast(
+          event: 'pin_toggle',
+          callback: (payload) {
+            final vault = payload['vault'];
+            if (vault == widget.vaultId && mounted) {
+              final list = payload['pinned'];
+              if (list is List) {
+                setState(() {
+                  _pinnedNoteIds = list.map((e) => e.toString()).toSet();
+                });
+              }
+            }
+          },
+        )
+        .subscribe();
   }
 
   Future<void> _syncFromCloudSilently() async {
@@ -101,8 +158,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
         for (int i = 0; i < cloudNotes.length; i++) {
           if (cloudNotes[i].id != _notes[i].id ||
               cloudNotes[i].title != _notes[i].title ||
-              cloudNotes[i].content != _notes[i].content ||
-              cloudNotes[i].isPinned != _notes[i].isPinned) {
+              cloudNotes[i].content != _notes[i].content) {
             hasChanges = true;
             break;
           }
@@ -118,8 +174,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
           if (match.isNotEmpty) {
             final remoteNote = match.first;
             if (remoteNote.title != _selectedNote!.title ||
-                remoteNote.content != _selectedNote!.content ||
-                remoteNote.isPinned != _selectedNote!.isPinned) {
+                remoteNote.content != _selectedNote!.content) {
               setState(() {
                 _selectedNote = remoteNote;
               });
@@ -147,6 +202,8 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
       _selectedNote = null;
       _notes = [];
       _notesNotifier.value = [];
+      _pinnedNoteIds.clear();
+      _loadPinnedNotes();
       _fetchNotes();
       _setupRealtime();
       _startPeriodicSync();
@@ -195,27 +252,6 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _setupRealtime() {
-    _realtimeChannel?.unsubscribe();
-    _realtimeChannel = Supabase.instance.client.channel('public:notes');
-
-    _realtimeChannel!
-        .onBroadcast(
-          event: 'sync',
-          callback: (payload) {
-            final vault = payload['vault'];
-            if (vault == widget.vaultId && mounted) {
-              _incomingSyncDebounce?.cancel();
-              _incomingSyncDebounce =
-                  Timer(const Duration(milliseconds: 300), () {
-                _syncFromCloudSilently();
-              });
-            }
-          },
-        )
-        .subscribe();
-  }
-
   Future<void> _createNewNote() async {
     final newId = _generateUuidV4();
     final newNote = Note(
@@ -252,6 +288,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
     setState(() {
       _notes.removeAt(noteIndex);
       _notesNotifier.value = List.of(_notes);
+      _pinnedNoteIds.remove(id);
       if (_selectedNote?.id == id) {
         _selectedNote = _notes.isNotEmpty ? _notes.first : null;
       }
@@ -272,51 +309,28 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _togglePinNote(Note note) async {
-    final newPinned = !note.isPinned;
-    final index = _notes.indexWhere((n) => n.id == note.id);
-    if (index == -1) return;
-
-    final updated = note.copyWith(isPinned: newPinned);
-
-    // Упаковываем статус is_pinned в JSON контента
-    String packagedContent = updated.content;
-    try {
-      final decoded = jsonDecode(updated.content);
-      if (decoded is List) {
-        packagedContent = jsonEncode({
-          'delta': decoded,
-          'is_pinned': newPinned,
-        });
-      } else if (decoded is Map) {
-        final map = Map<String, dynamic>.from(decoded);
-        map['is_pinned'] = newPinned;
-        packagedContent = jsonEncode(map);
-      }
-    } catch (_) {}
-
-    final noteToSave = updated.copyWith(content: packagedContent);
-
+    final newPinned = !_pinnedNoteIds.contains(note.id);
     setState(() {
-      _notes[index] = noteToSave;
-      _notesNotifier.value = List.of(_notes);
-      if (_selectedNote?.id == note.id) {
-        _selectedNote = noteToSave;
+      if (newPinned) {
+        _pinnedNoteIds.add(note.id);
+      } else {
+        _pinnedNoteIds.remove(note.id);
       }
     });
 
     try {
-      await Supabase.instance.client.from('notes').upsert({
-        'id': noteToSave.id,
-        'vault_id': noteToSave.vaultId,
-        'title': noteToSave.title,
-        'content': noteToSave.content,
-        'plain_text': noteToSave.plainText,
-        'updated_at': DateTime.now().toIso8601String(),
-      });
-      _broadcastSync();
-    } catch (e) {
-      debugPrint('Error toggling pin: $e');
-    }
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(
+          'pinned_${widget.vaultId}', _pinnedNoteIds.toList());
+
+      _realtimeChannel?.sendBroadcastMessage(
+        event: 'pin_toggle',
+        payload: {
+          'vault': widget.vaultId,
+          'pinned': _pinnedNoteIds.toList(),
+        },
+      );
+    } catch (_) {}
   }
 
   void _handleNoteUpdated(
@@ -341,7 +355,11 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   }
 
   List<Note> get _filteredNotes {
-    var list = _notes;
+    var list = _notes.map((n) {
+      final isPinned = _pinnedNoteIds.contains(n.id);
+      return n.isPinned != isPinned ? n.copyWith(isPinned: isPinned) : n;
+    }).toList();
+
     if (_searchQuery.isNotEmpty) {
       final q = _searchQuery.toLowerCase();
       list = list.where((n) {
@@ -349,7 +367,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
             n.plainText.toLowerCase().contains(q);
       }).toList();
     }
-    // Сортировка: закрепленные всегда сверху, далее по дате
+
     list.sort((a, b) {
       if (a.isPinned && !b.isPinned) return -1;
       if (!a.isPinned && b.isPinned) return 1;
@@ -414,7 +432,8 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
                       ),
                       IconButton(
                         icon: Icon(Icons.close_rounded,
-                            size: 20, color: theme.colorScheme.onSurfaceVariant),
+                            size: 20,
+                            color: theme.colorScheme.onSurfaceVariant),
                         onPressed: () => Navigator.of(context).pop(),
                       ),
                     ],
@@ -597,7 +616,6 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
       );
     }
 
-    // Mobile layout
     return Scaffold(
       backgroundColor: Theme.of(context).colorScheme.surface,
       appBar: AppBar(
@@ -715,7 +733,6 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
       color: theme.colorScheme.surface,
       child: Column(
         children: [
-          // Header: Vault badge, theme switcher, new note button
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 16, 12, 12),
             child: Row(
@@ -782,8 +799,6 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
               ],
             ),
           ),
-
-          // Borderless search field
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
             child: Container(
@@ -797,7 +812,8 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
               child: TextField(
                 controller: _searchController,
                 focusNode: _searchFocusNode,
-                style: TextStyle(fontSize: 13, color: theme.colorScheme.onSurface),
+                style:
+                    TextStyle(fontSize: 13, color: theme.colorScheme.onSurface),
                 onChanged: (val) => setState(() => _searchQuery = val),
                 decoration: InputDecoration(
                   prefixIcon: Icon(
@@ -832,8 +848,6 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(height: 8),
-
-          // Notes list
           Expanded(
             child: _isLoading
                 ? Center(
@@ -898,7 +912,8 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
             child: TextField(
               controller: _searchController,
               onChanged: (val) => setState(() => _searchQuery = val),
-              style: TextStyle(fontSize: 14, color: theme.colorScheme.onSurface),
+              style:
+                  TextStyle(fontSize: 14, color: theme.colorScheme.onSurface),
               decoration: InputDecoration(
                 prefixIcon: Icon(Icons.search_rounded,
                     size: 18, color: theme.colorScheme.onSurfaceVariant),
@@ -1008,7 +1023,6 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   }
 }
 
-// Bouncing Pressable widget with spring scale 0.97
 class BouncingPressable extends StatefulWidget {
   final Widget child;
   final VoidCallback? onTap;
@@ -1167,7 +1181,8 @@ class _SidebarNoteCardState extends State<_SidebarNoteCard> {
                         widget.note.formattedDate,
                         style: TextStyle(
                           fontSize: 10,
-                          color: theme.colorScheme.onSurfaceVariant.withAlpha(180),
+                          color:
+                              theme.colorScheme.onSurfaceVariant.withAlpha(180),
                         ),
                       ),
                   ],
@@ -1701,26 +1716,31 @@ class _NoteEditorViewState extends State<NoteEditorView>
   late TextEditingController _titleController;
   late QuillController _quillController;
   final FocusNode _editorFocusNode = FocusNode();
+  final ScrollController _editorScrollController = ScrollController();
   StreamSubscription? _docChangeSub;
   Timer? _debounceTimer;
+
   bool _isInternalDocUpdate = false;
+  bool _isApplyingRemoteChange = false;
 
   String _lastSavedTitle = '';
   String _lastSavedContent = '';
   DateTime _lastLocalEditTime = DateTime.fromMillisecondsSinceEpoch(0);
+  String? _pendingRemoteTitle;
+  String? _pendingRemoteContent;
 
   final ValueNotifier<bool> _isSavingNotifier = ValueNotifier(false);
   final ValueNotifier<bool> _isSavedNotifier = ValueNotifier(true);
 
   // Floating selection toolbar state
   bool _showFloatingToolbar = false;
-  // Slash menu state
-  bool _showSlashMenu = false;
+  // Slash menu notifier (prevents rebuilding the entire editor during typing)
+  final ValueNotifier<bool> _showSlashMenuNotifier = ValueNotifier(false);
 
   void _subscribeToDocChanges() {
     _docChangeSub?.cancel();
     _docChangeSub = _quillController.document.changes.listen((change) {
-      if (!_isInternalDocUpdate) {
+      if (!_isInternalDocUpdate && !_isApplyingRemoteChange) {
         _onContentChanged();
       }
     });
@@ -1819,6 +1839,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
       _debounceTimer?.cancel();
       _saveNote();
 
+      _isApplyingRemoteChange = true;
       _titleController.text = widget.note.title;
       _lastSavedTitle = widget.note.title;
       _lastSavedContent = widget.note.content;
@@ -1845,6 +1866,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
         const TextSelection.collapsed(offset: 0),
         ChangeSource.local,
       );
+      _isApplyingRemoteChange = false;
       _isSavedNotifier.value = true;
     } else {
       final remoteTitle = widget.note.title;
@@ -1857,61 +1879,126 @@ class _NoteEditorViewState extends State<NoteEditorView>
       if (titleChanged || contentChanged) {
         final hasPendingLocalChanges =
             _isSavingNotifier.value || (_debounceTimer?.isActive ?? false);
-        final msSinceLocalEdit =
-            DateTime.now().difference(_lastLocalEditTime).inMilliseconds;
 
-        if (_isInsertingImage ||
-            hasPendingLocalChanges ||
-            msSinceLocalEdit < 2000) {
+        if (_isInsertingImage || hasPendingLocalChanges) {
+          // Defer update until local saving completes
+          _pendingRemoteTitle = remoteTitle;
+          _pendingRemoteContent = remoteContent;
           return;
         }
 
+        _pendingRemoteTitle = null;
+        _pendingRemoteContent = null;
         _lastSavedTitle = remoteTitle;
         _lastSavedContent = remoteContent;
         _isSavedNotifier.value = true;
 
-        if (titleChanged) {
-          _titleController.text = remoteTitle;
-        }
-        if (contentChanged && remoteContent.isNotEmpty) {
-          try {
-            final decoded = jsonDecode(remoteContent);
-            Document newDoc;
-            if (decoded is List) {
-              newDoc = Document.fromJson(decoded);
-            } else if (decoded is Map && decoded['delta'] is List) {
-              newDoc = Document.fromJson(decoded['delta']);
-            } else {
-              newDoc = Document();
-            }
-            final oldSelection = _quillController.selection;
-            _setQuillDocument(newDoc);
-            final newLen = _quillController.document.length;
-            final safeOffset = oldSelection.baseOffset.clamp(0, newLen - 1);
-            _quillController.updateSelection(
-              TextSelection.collapsed(offset: safeOffset),
-              ChangeSource.local,
-            );
-          } catch (_) {}
+        _isApplyingRemoteChange = true;
+        try {
+          if (titleChanged) {
+            _titleController.text = remoteTitle;
+          }
+          if (contentChanged && remoteContent.isNotEmpty) {
+            try {
+              final decoded = jsonDecode(remoteContent);
+              Document newDoc;
+              if (decoded is List) {
+                newDoc = Document.fromJson(decoded);
+              } else if (decoded is Map && decoded['delta'] is List) {
+                newDoc = Document.fromJson(decoded['delta']);
+              } else {
+                newDoc = Document();
+              }
+              final oldSelection = _quillController.selection;
+              _setQuillDocument(newDoc);
+              final newLen = _quillController.document.length;
+              final safeOffset = oldSelection.baseOffset.clamp(0, newLen - 1);
+              _quillController.updateSelection(
+                TextSelection.collapsed(offset: safeOffset),
+                ChangeSource.local,
+              );
+            } catch (_) {}
+          }
+        } finally {
+          _isApplyingRemoteChange = false;
         }
       }
     }
   }
 
+  void _applyPendingRemoteChange() {
+    if (!mounted) return;
+    if (_pendingRemoteTitle == null && _pendingRemoteContent == null) return;
+    if (_isSavingNotifier.value ||
+        (_debounceTimer?.isActive ?? false) ||
+        _isInsertingImage) {
+      return;
+    }
+
+    final remoteTitle = _pendingRemoteTitle;
+    final remoteContent = _pendingRemoteContent;
+    _pendingRemoteTitle = null;
+    _pendingRemoteContent = null;
+
+    if (remoteTitle != null &&
+        remoteTitle != _lastSavedTitle &&
+        remoteTitle != _titleController.text) {
+      _lastSavedTitle = remoteTitle;
+      _isApplyingRemoteChange = true;
+      try {
+        _titleController.text = remoteTitle;
+      } finally {
+        _isApplyingRemoteChange = false;
+      }
+    }
+
+    if (remoteContent != null &&
+        remoteContent != _lastSavedContent &&
+        remoteContent.isNotEmpty) {
+      _lastSavedContent = remoteContent;
+      _isApplyingRemoteChange = true;
+      try {
+        final decoded = jsonDecode(remoteContent);
+        Document newDoc;
+        if (decoded is List) {
+          newDoc = Document.fromJson(decoded);
+        } else if (decoded is Map && decoded['delta'] is List) {
+          newDoc = Document.fromJson(decoded['delta']);
+        } else {
+          newDoc = Document();
+        }
+        final oldSelection = _quillController.selection;
+        _setQuillDocument(newDoc);
+        final newLen = _quillController.document.length;
+        final safeOffset = oldSelection.baseOffset.clamp(0, newLen - 1);
+        _quillController.updateSelection(
+          TextSelection.collapsed(offset: safeOffset),
+          ChangeSource.local,
+        );
+      } catch (_) {} finally {
+        _isApplyingRemoteChange = false;
+      }
+    }
+    _isSavedNotifier.value = true;
+  }
+
   void _onTitleChanged() {
+    if (_isApplyingRemoteChange) return;
     _scheduleSave();
   }
 
   void _onContentChanged() {
-    // Check if user typed '/' to show slash commands
+    if (_isApplyingRemoteChange || _isInternalDocUpdate) return;
+
+    // Check if user typed '/'
     final text = _quillController.document.toPlainText();
     final sel = _quillController.selection.baseOffset;
     if (sel > 0 && sel <= text.length && text[sel - 1] == '/') {
-      if (!_showSlashMenu) {
-        setState(() => _showSlashMenu = true);
+      if (!_showSlashMenuNotifier.value) {
+        _showSlashMenuNotifier.value = true;
       }
-    } else if (_showSlashMenu) {
-      setState(() => _showSlashMenu = false);
+    } else if (_showSlashMenuNotifier.value) {
+      _showSlashMenuNotifier.value = false;
     }
     _scheduleSave();
   }
@@ -1925,27 +2012,14 @@ class _NoteEditorViewState extends State<NoteEditorView>
 
   Future<void> _saveNote({bool force = false}) async {
     final title = _titleController.text.trim();
-    final rawDelta = _quillController.document.toDelta().toJson();
+    final content = jsonEncode(_quillController.document.toDelta().toJson());
 
-    // Защита от сохранения data:image base64
-    final jsonString = jsonEncode(rawDelta);
-    if (jsonString.contains('data:image/')) {
+    // Never save temporary data:image
+    if (content.contains('data:image/')) {
       return;
     }
 
-    String contentToSave;
-    if (widget.note.isPinned) {
-      contentToSave = jsonEncode({
-        'delta': rawDelta,
-        'is_pinned': true,
-      });
-    } else {
-      contentToSave = jsonString;
-    }
-
-    if (!force &&
-        title == _lastSavedTitle &&
-        contentToSave == _lastSavedContent) {
+    if (!force && title == _lastSavedTitle && content == _lastSavedContent) {
       _isSavedNotifier.value = true;
       return;
     }
@@ -1955,24 +2029,27 @@ class _NoteEditorViewState extends State<NoteEditorView>
     try {
       final plainText = _quillController.document.toPlainText().trim();
       widget.onNoteUpdated
-          ?.call(widget.note.id, title, plainText, contentToSave);
+          ?.call(widget.note.id, title, plainText, content);
 
       await Supabase.instance.client.from('notes').upsert({
         'id': widget.note.id,
         'vault_id': widget.vaultId,
         'title': title,
-        'content': contentToSave,
+        'content': content,
         'plain_text': plainText,
         'updated_at': DateTime.now().toIso8601String(),
       });
       _lastSavedTitle = title;
-      _lastSavedContent = contentToSave;
+      _lastSavedContent = content;
       _isSavedNotifier.value = true;
       widget.onBroadcastSync?.call();
     } catch (e) {
       debugPrint('Save note error: $e');
     } finally {
       if (mounted) _isSavingNotifier.value = false;
+      if (_pendingRemoteContent != null || _pendingRemoteTitle != null) {
+        _applyPendingRemoteChange();
+      }
     }
   }
 
@@ -1985,9 +2062,11 @@ class _NoteEditorViewState extends State<NoteEditorView>
     _saveNote();
     _titleController.dispose();
     _editorFocusNode.dispose();
+    _editorScrollController.dispose();
     _quillController.dispose();
     _isSavingNotifier.dispose();
     _isSavedNotifier.dispose();
+    _showSlashMenuNotifier.dispose();
     super.dispose();
   }
 
@@ -2140,7 +2219,6 @@ class _NoteEditorViewState extends State<NoteEditorView>
   }
 
   void _applySlashCommand(Attribute? attr, {bool isImage = false}) {
-    // Remove the '/' character
     final sel = _quillController.selection.baseOffset;
     if (sel > 0) {
       _quillController.replaceText(sel - 1, 1, '', null);
@@ -2149,7 +2227,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
         ChangeSource.local,
       );
     }
-    setState(() => _showSlashMenu = false);
+    _showSlashMenuNotifier.value = false;
 
     if (isImage) {
       _pickImage();
@@ -2187,7 +2265,6 @@ class _NoteEditorViewState extends State<NoteEditorView>
 
     return Stack(
       children: [
-        // Main Editor Canvas
         GestureDetector(
           onTap: () {
             if (!_editorFocusNode.hasFocus) {
@@ -2208,7 +2285,6 @@ class _NoteEditorViewState extends State<NoteEditorView>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Top header: Minimal title and status dot
                     Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
@@ -2238,18 +2314,16 @@ class _NoteEditorViewState extends State<NoteEditorView>
                           ),
                         ),
                         const SizedBox(width: 12),
-                        // Micro status indicator dot
                         _buildStatusDot(),
                       ],
                     ),
                     const SizedBox(height: 24),
-
-                    // Quill Editor Canvas
                     QuillEditor(
                       controller: _quillController,
                       focusNode: _editorFocusNode,
-                      scrollController: ScrollController(),
+                      scrollController: _editorScrollController,
                       config: QuillEditorConfig(
+                        scrollable: false,
                         autoFocus: false,
                         expands: false,
                         padding: EdgeInsets.zero,
@@ -2359,8 +2433,6 @@ class _NoteEditorViewState extends State<NoteEditorView>
             ),
           ),
         ),
-
-        // Floating Selection Toolbar Capsule (Desktop)
         if (_showFloatingToolbar && !widget.isMobile)
           Positioned(
             top: 24,
@@ -2370,18 +2442,19 @@ class _NoteEditorViewState extends State<NoteEditorView>
               child: _buildFloatingSelectionCapsule(),
             ),
           ),
-
-        // Slash command menu
-        if (_showSlashMenu)
-          Positioned(
-            top: 80,
-            left: MediaQuery.sizeOf(context).width > 720
-                ? (MediaQuery.sizeOf(context).width - 270) / 2 - 130
-                : 30,
-            child: _buildSlashCommandMenu(),
-          ),
-
-        // Mobile Bottom Keyboard Strip
+        ValueListenableBuilder<bool>(
+          valueListenable: _showSlashMenuNotifier,
+          builder: (context, showSlash, _) {
+            if (!showSlash) return const SizedBox.shrink();
+            return Positioned(
+              top: 80,
+              left: MediaQuery.sizeOf(context).width > 720
+                  ? (MediaQuery.sizeOf(context).width - 270) / 2 - 130
+                  : 30,
+              child: _buildSlashCommandMenu(),
+            );
+          },
+        ),
         if (widget.isMobile)
           Positioned(
             bottom: MediaQuery.viewInsetsOf(context).bottom + 8,
