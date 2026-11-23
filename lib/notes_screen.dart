@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -72,7 +71,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
 
   void _startPeriodicSync() {
     _periodicSyncTimer?.cancel();
-    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _syncFromCloudSilently();
     });
   }
@@ -200,7 +199,16 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
       }
     } catch (e) {
       debugPrint('Fetch notes error: $e');
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() => _isLoading = false);
+        if (_notes.isEmpty) {
+          Future.delayed(const Duration(seconds: 2), () {
+            if (mounted && _notes.isEmpty) {
+              _fetchNotes();
+            }
+          });
+        }
+      }
     }
   }
 
@@ -618,39 +626,48 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
     }
 
     if (notes.isEmpty) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                _searchQuery.isEmpty
-                    ? Icons.note_alt_outlined
-                    : Icons.search_off_rounded,
-                size: 38,
-                color: isDark ? Colors.white24 : Colors.black26,
-              ),
-              const SizedBox(height: 12),
-              Text(
-                _searchQuery.isEmpty
-                    ? 'Заметок пока нет\nНажмите «Новая», чтобы начать'
-                    : 'Ничего не найдено',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 13,
-                  color: isDark ? Colors.white38 : Colors.black45,
+      return RefreshIndicator(
+        onRefresh: _fetchNotes,
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          child: Container(
+            height: 400,
+            alignment: Alignment.center,
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  _searchQuery.isEmpty
+                      ? Icons.note_alt_outlined
+                      : Icons.search_off_rounded,
+                  size: 38,
+                  color: isDark ? Colors.white24 : Colors.black26,
                 ),
-              ),
-            ],
+                const SizedBox(height: 12),
+                Text(
+                  _searchQuery.isEmpty
+                      ? 'Заметок пока нет\nНажмите «Новая», чтобы начать'
+                      : 'Ничего не найдено',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: isDark ? Colors.white38 : Colors.black45,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       );
     }
 
-    return ListView.builder(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      itemCount: notes.length,
+    return RefreshIndicator(
+      onRefresh: _fetchNotes,
+      child: ListView.builder(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        itemCount: notes.length,
       itemBuilder: (context, index) {
         final note = notes[index];
         final isSelected = isDesktop && _selectedNote?.id == note.id;
@@ -679,6 +696,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
           onDelete: () => _confirmDeleteNote(note),
         );
       },
+    ),
     );
   }
 
@@ -994,22 +1012,32 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(_title.isEmpty ? 'Заметка' : _title),
-        elevation: 0,
-      ),
-      body: NoteEditorView(
-        key: ValueKey(widget.initialNote.id),
-        note: widget.initialNote,
-        vaultId: widget.vaultId,
-        onNoteUpdated: _handleNoteUpdated,
-        onDeleteRequested: () {
-          Navigator.of(context).pop();
-          widget.onNoteDeleted(widget.initialNote.id);
-        },
-        onBroadcastSync: widget.onBroadcastSync,
-      ),
+    return ValueListenableBuilder<List<Note>>(
+      valueListenable: widget.notesNotifier,
+      builder: (context, notesList, _) {
+        final currentNote = notesList.firstWhere(
+          (n) => n.id == widget.initialNote.id,
+          orElse: () => widget.initialNote,
+        );
+        return Scaffold(
+          appBar: AppBar(
+            title: Text(
+                _title.isNotEmpty ? _title : (currentNote.title.isEmpty ? 'Заметка' : currentNote.title)),
+            elevation: 0,
+          ),
+          body: NoteEditorView(
+            key: ValueKey(widget.initialNote.id),
+            note: currentNote,
+            vaultId: widget.vaultId,
+            onNoteUpdated: _handleNoteUpdated,
+            onDeleteRequested: () {
+              Navigator.of(context).pop();
+              widget.onNoteDeleted(widget.initialNote.id);
+            },
+            onBroadcastSync: widget.onBroadcastSync,
+          ),
+        );
+      },
     );
   }
 }
@@ -1649,7 +1677,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     _debounceTimer = Timer(const Duration(milliseconds: 700), _saveNote);
   }
 
-  Future<void> _saveNote() async {
+  Future<void> _saveNote({bool force = false}) async {
     final title = _titleController.text.trim();
     final content = jsonEncode(_quillController.document.toDelta().toJson());
 
@@ -1658,13 +1686,11 @@ class _NoteEditorViewState extends State<NoteEditorView> {
       return;
     }
 
-    if (title == _lastSavedTitle && content == _lastSavedContent) {
+    if (!force && title == _lastSavedTitle && content == _lastSavedContent) {
       _isSavedNotifier.value = true;
       return;
     }
 
-    _lastSavedTitle = title;
-    _lastSavedContent = content;
     _isSavingNotifier.value = true;
 
     try {
@@ -1681,11 +1707,14 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         'plain_text': plainText,
         'updated_at': DateTime.now().toIso8601String(),
       });
+      _lastSavedTitle = title;
+      _lastSavedContent = content;
       _isSavedNotifier.value = true;
       widget.onBroadcastSync?.call();
-    } catch (_) {
+    } catch (e) {
+      debugPrint('Save note error: $e');
     } finally {
-      _isSavingNotifier.value = false;
+      if (mounted) _isSavingNotifier.value = false;
     }
   }
 
@@ -1768,8 +1797,6 @@ class _NoteEditorViewState extends State<NoteEditorView> {
       }
     }
     if (found) {
-      final newContent = jsonEncode(jsonList);
-      _lastSavedContent = newContent;
       _lastLocalEditTime = DateTime.now();
 
       final oldSelection = _quillController.selection;
@@ -1836,7 +1863,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
           AppImageCache.put(cloudUrl, optimized);
           // Подменяем локальный base64 постоянным облачным URL
           _replaceImageSourceInDocument(localDataUrl, cloudUrl);
-          _saveNote();
+          await _saveNote(force: true);
         }
       } catch (e) {
         debugPrint('Image upload error: $e');
