@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 import 'package:image/image.dart' as img;
+import 'package:my_notes/notes_screen.dart';
 
 void main() {
   test('Image package can decode and compress to JPG', () {
@@ -34,11 +35,9 @@ void main() {
 
     final jsonList = c.document.toDelta().toJson();
     for (final item in jsonList) {
-      if (item is Map) {
-        final insert = item['insert'];
-        if (insert is Map && insert['image'] == 'data:image/png;base64,OLD') {
-          insert['image'] = 'https://cloud.com/image.png';
-        }
+      final insert = item['insert'];
+      if (insert is Map && insert['image'] == 'data:image/png;base64,OLD') {
+        insert['image'] = 'https://cloud.com/image.png';
       }
     }
     c.document = Document.fromJson(jsonList);
@@ -50,7 +49,8 @@ void main() {
   test('AppImageCache stores and retrieves image bytes', () {
     final bytes = Uint8List.fromList([1, 2, 3, 4]);
     const url = 'https://cloud.com/test.png';
-    expect(bytes.length, 4);
+    AppImageCache.put(url, bytes);
+    expect(AppImageCache.get(url), bytes);
   });
 
   test('dart:ui instantiateImageCodec is available and functional', () async {

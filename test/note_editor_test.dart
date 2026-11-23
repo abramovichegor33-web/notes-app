@@ -154,4 +154,84 @@ void main() {
     expect(find.text('Synced from Phone'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets(
+      'NoteEditorView triggers onNoteUpdated when edited after remote doc sync',
+      (WidgetTester tester) async {
+    final noteInitial = Note(
+      id: 'doc-sync-edit-note',
+      vaultId: 'TEST-123',
+      title: 'Initial Title',
+      plainText: 'Initial text',
+      content: jsonEncode([
+        {'insert': 'Initial text\n'}
+      ]),
+      updatedAt: DateTime.now(),
+    );
+
+    final noteUpdated = Note(
+      id: 'doc-sync-edit-note',
+      vaultId: 'TEST-123',
+      title: 'Synced Title',
+      plainText: 'Synced text',
+      content: jsonEncode([
+        {'insert': 'Synced text\n'}
+      ]),
+      updatedAt: DateTime.now().add(const Duration(seconds: 1)),
+    );
+
+    final currentNote = ValueNotifier<Note>(noteInitial);
+    String? updatedContent;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        localizationsDelegates: const [
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+          FlutterQuillLocalizations.delegate,
+        ],
+        supportedLocales: const [
+          Locale('en', 'US'),
+          Locale('ru', 'RU'),
+        ],
+        home: Scaffold(
+          body: ValueListenableBuilder<Note>(
+            valueListenable: currentNote,
+            builder: (context, note, _) => NoteEditorView(
+              key: ValueKey(note.id),
+              note: note,
+              vaultId: 'TEST-123',
+              onNoteUpdated: (id, title, plain, content) {
+                updatedContent = content;
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.pump();
+    expect(find.text('Initial Title'), findsOneWidget);
+
+    // 1. Simulate remote sync replacing the document
+    currentNote.value = noteUpdated;
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    expect(find.text('Synced Title'), findsOneWidget);
+
+    // 2. Now user types text into the editor after document was replaced
+    final quillEditorFinder = find.byType(QuillEditor);
+    expect(quillEditorFinder, findsOneWidget);
+
+    final quillEditor = tester.widget<QuillEditor>(quillEditorFinder);
+    quillEditor.controller.document.insert(0, '123egor ');
+    await tester.pump();
+    // Wait for the 500ms debounce save timer to fire
+    await tester.pump(const Duration(milliseconds: 600));
+
+    expect(updatedContent, isNotNull);
+    expect(updatedContent!.contains('123egor'), isTrue);
+  });
 }

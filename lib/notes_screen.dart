@@ -1539,11 +1539,12 @@ class NoteEditorView extends StatefulWidget {
   State<NoteEditorView> createState() => _NoteEditorViewState();
 }
 
-class _NoteEditorViewState extends State<NoteEditorView> {
+class _NoteEditorViewState extends State<NoteEditorView> with WidgetsBindingObserver {
   late TextEditingController _titleController;
   late QuillController _quillController;
   StreamSubscription? _docChangeSub;
   Timer? _debounceTimer;
+  bool _isInternalDocUpdate = false;
 
   String _lastSavedTitle = '';
   String _lastSavedContent = '';
@@ -1552,9 +1553,30 @@ class _NoteEditorViewState extends State<NoteEditorView> {
   final ValueNotifier<bool> _isSavingNotifier = ValueNotifier(false);
   final ValueNotifier<bool> _isSavedNotifier = ValueNotifier(true);
 
+  void _subscribeToDocChanges() {
+    _docChangeSub?.cancel();
+    _docChangeSub = _quillController.document.changes.listen((_) {
+      if (!_isInternalDocUpdate) {
+        _onContentChanged();
+      }
+    });
+  }
+
+  void _setQuillDocument(Document doc) {
+    _isInternalDocUpdate = true;
+    try {
+      _docChangeSub?.cancel();
+      _quillController.document = doc;
+      _subscribeToDocChanges();
+    } finally {
+      _isInternalDocUpdate = false;
+    }
+  }
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _titleController = TextEditingController(text: widget.note.title);
     _lastSavedTitle = widget.note.title;
     _lastSavedContent = widget.note.content;
@@ -1584,7 +1606,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     }
 
     _titleController.addListener(_onTitleChanged);
-    _docChangeSub = _quillController.changes.listen((_) => _onContentChanged());
+    _subscribeToDocChanges();
 
     // Слушатель веб-события вставки изображения (Cmd+V в WKWebView)
     WebPasteListener.setHandler((bytes) {
@@ -1592,6 +1614,17 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         _insertImageBytes(bytes);
       }
     });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      if (_debounceTimer?.isActive ?? false) {
+        _debounceTimer?.cancel();
+        _saveNote();
+      }
+    }
   }
 
   @override
@@ -1605,22 +1638,22 @@ class _NoteEditorViewState extends State<NoteEditorView> {
       _lastSavedTitle = widget.note.title;
       _lastSavedContent = widget.note.content;
 
-      _docChangeSub?.pause();
+      Document newDoc;
       if (widget.note.content.isNotEmpty) {
         try {
           final decoded = jsonDecode(widget.note.content);
-          _quillController.document = Document.fromJson(decoded);
+          newDoc = Document.fromJson(decoded);
         } catch (_) {
-          _quillController.document = Document();
+          newDoc = Document();
         }
       } else {
-        _quillController.document = Document();
+        newDoc = Document();
       }
+      _setQuillDocument(newDoc);
       _quillController.updateSelection(
         const TextSelection.collapsed(offset: 0),
         ChangeSource.local,
       );
-      _docChangeSub?.resume();
       _isSavedNotifier.value = true;
     } else {
       final remoteTitle = widget.note.title;
@@ -1655,16 +1688,14 @@ class _NoteEditorViewState extends State<NoteEditorView> {
             try {
               final decoded = jsonDecode(remoteContent);
               final newDoc = Document.fromJson(decoded);
-              _docChangeSub?.pause();
               final oldSelection = _quillController.selection;
-              _quillController.document = newDoc;
+              _setQuillDocument(newDoc);
               final newLen = _quillController.document.length;
               final safeOffset = oldSelection.baseOffset.clamp(0, newLen - 1);
               _quillController.updateSelection(
                 TextSelection.collapsed(offset: safeOffset),
                 ChangeSource.local,
               );
-              _docChangeSub?.resume();
             } catch (_) {}
           }
         }
@@ -1683,7 +1714,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     _lastLocalEditTime = DateTime.now();
     _isSavedNotifier.value = false;
     _debounceTimer?.cancel();
-    _debounceTimer = Timer(const Duration(milliseconds: 700), _saveNote);
+    _debounceTimer = Timer(const Duration(milliseconds: 500), _saveNote);
   }
 
   Future<void> _saveNote({bool force = false}) async {
@@ -1729,6 +1760,7 @@ class _NoteEditorViewState extends State<NoteEditorView> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     WebPasteListener.setHandler(null);
     _debounceTimer?.cancel();
     _docChangeSub?.cancel();
@@ -1797,20 +1829,17 @@ class _NoteEditorViewState extends State<NoteEditorView> {
     final jsonList = _quillController.document.toDelta().toJson();
     bool found = false;
     for (final item in jsonList) {
-      if (item is Map) {
-        final insert = item['insert'];
-        if (insert is Map && insert['image'] == oldSource) {
-          insert['image'] = newSource;
-          found = true;
-        }
+      final insert = item['insert'];
+      if (insert is Map && insert['image'] == oldSource) {
+        insert['image'] = newSource;
+        found = true;
       }
     }
     if (found) {
       _lastLocalEditTime = DateTime.now();
 
       final oldSelection = _quillController.selection;
-      _docChangeSub?.pause();
-      _quillController.document = Document.fromJson(jsonList);
+      _setQuillDocument(Document.fromJson(jsonList));
       final maxOffset = _quillController.document.length - 1;
       final safeOffset =
           oldSelection.baseOffset.clamp(0, maxOffset < 0 ? 0 : maxOffset);
@@ -1818,7 +1847,6 @@ class _NoteEditorViewState extends State<NoteEditorView> {
         TextSelection.collapsed(offset: safeOffset),
         ChangeSource.local,
       );
-      _docChangeSub?.resume();
     }
   }
 
