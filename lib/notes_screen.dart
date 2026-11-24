@@ -1501,69 +1501,47 @@ class AppImageCache {
   static bool has(String url) => _cache.containsKey(url);
 }
 
-class ImageDragPayload {
-  final String imageSource;
-  final int nodeOffset;
+class CanvasImage {
+  final String id;
+  String url;
+  double x;
+  double y;
+  double width;
+  double? height;
 
-  const ImageDragPayload({
-    required this.imageSource,
-    required this.nodeOffset,
-  });
-}
-
-class AppImageEmbedBuilder extends EmbedBuilder {
-  final Function(String source)? onDeleteImage;
-  final Function(String source)? onCopyImage;
-  final bool isMobile;
-
-  AppImageEmbedBuilder({
-    this.onDeleteImage,
-    this.onCopyImage,
-    this.isMobile = false,
+  CanvasImage({
+    required this.id,
+    required this.url,
+    required this.x,
+    required this.y,
+    this.width = 320.0,
+    this.height,
   });
 
-  @override
-  String get key => BlockEmbed.imageType;
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'url': url,
+        'x': x,
+        'y': y,
+        'width': width,
+        if (height != null) 'height': height,
+      };
 
-  @override
-  Widget build(
-    BuildContext context,
-    EmbedContext embedContext,
-  ) {
-    return _AppImageWidget(
-      embedContext: embedContext,
-      onDeleteImage: onDeleteImage,
-      onCopyImage: onCopyImage,
-      isMobile: isMobile,
+  factory CanvasImage.fromJson(Map<String, dynamic> json) {
+    return CanvasImage(
+      id: (json['id'] ?? '').toString(),
+      url: (json['url'] ?? '').toString(),
+      x: (json['x'] as num?)?.toDouble() ?? 20.0,
+      y: (json['y'] as num?)?.toDouble() ?? 20.0,
+      width: (json['width'] as num?)?.toDouble() ?? 320.0,
+      height: (json['height'] as num?)?.toDouble(),
     );
   }
 }
 
-class _AppImageWidget extends StatefulWidget {
-  final EmbedContext embedContext;
-  final Function(String source)? onDeleteImage;
-  final Function(String source)? onCopyImage;
-  final bool isMobile;
-
-  const _AppImageWidget({
-    required this.embedContext,
-    this.onDeleteImage,
-    this.onCopyImage,
-    this.isMobile = false,
-  });
-
-  @override
-  State<_AppImageWidget> createState() => _AppImageWidgetState();
-}
-
-class _AppImageWidgetState extends State<_AppImageWidget> {
-  bool _isHovered = false;
-  void _deleteImage() {
-    final imageSource = widget.embedContext.node.value.data.toString();
-    widget.onDeleteImage?.call(imageSource);
-  }
-
-  Future<void> _handleCopyImage(String imageSource) async {
+class ImageActions {
+  static Future<void> copyImage(
+      BuildContext context, String imageSource) async {
     try {
       Uint8List? bytes = AppImageCache.get(imageSource);
       if (bytes == null) {
@@ -1592,7 +1570,7 @@ class _AppImageWidgetState extends State<_AppImageWidget> {
           await Pasteboard.writeImage(bytes);
         }
 
-        if (mounted) {
+        if (context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: const Row(
@@ -1616,7 +1594,8 @@ class _AppImageWidgetState extends State<_AppImageWidget> {
     }
   }
 
-  void _showLightbox(Widget imageWidget, String imageSource) {
+  static void showLightbox(
+      BuildContext context, Widget imageWidget, String imageSource) {
     showDialog(
       context: context,
       builder: (dialogCtx) => Dialog(
@@ -1640,7 +1619,7 @@ class _AppImageWidgetState extends State<_AppImageWidget> {
                   IconButton(
                     icon: const Icon(Icons.copy_rounded, color: Colors.white),
                     tooltip: 'Скопировать',
-                    onPressed: () => _handleCopyImage(imageSource),
+                    onPressed: () => copyImage(context, imageSource),
                   ),
                   IconButton(
                     icon: const Icon(Icons.close_rounded, color: Colors.white),
@@ -1655,6 +1634,41 @@ class _AppImageWidgetState extends State<_AppImageWidget> {
       ),
     );
   }
+}
+
+class _CanvasImageWidget extends StatefulWidget {
+  final CanvasImage image;
+  final double maxWidth;
+  final bool isMobile;
+  final VoidCallback onSelect;
+  final Function(Offset delta) onDragUpdate;
+  final VoidCallback onDragEnd;
+  final Function(double deltaWidth) onResize;
+  final VoidCallback onDelete;
+  final Function(String source) onCopy;
+  final Function(String source, Widget imageWidget) onShowLightbox;
+
+  const _CanvasImageWidget({
+    super.key,
+    required this.image,
+    required this.maxWidth,
+    required this.isMobile,
+    required this.onSelect,
+    required this.onDragUpdate,
+    required this.onDragEnd,
+    required this.onResize,
+    required this.onDelete,
+    required this.onCopy,
+    required this.onShowLightbox,
+  });
+
+  @override
+  State<_CanvasImageWidget> createState() => _CanvasImageWidgetState();
+}
+
+class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
+  bool _isHovered = false;
+  bool _isDragging = false;
 
   void _showContextMenu(
       TapDownDetails details, String imageSource, Widget imageWidget) async {
@@ -1730,24 +1744,21 @@ class _AppImageWidgetState extends State<_AppImageWidget> {
 
     if (!mounted) return;
     if (selected == 'copy_image') {
-      _handleCopyImage(imageSource);
+      widget.onCopy(imageSource);
     } else if (selected == 'copy_link') {
       Clipboard.setData(ClipboardData(text: imageSource));
     } else if (selected == 'delete') {
-      _deleteImage();
+      widget.onDelete();
     } else if (selected == 'view') {
-      _showLightbox(imageWidget, imageSource);
+      widget.onShowLightbox(imageSource, imageWidget);
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final imageSource = widget.embedContext.node.value.data.toString();
-
-    Widget imageWidget;
+  Widget _buildImageContent() {
+    final imageSource = widget.image.url;
     final cachedBytes = AppImageCache.get(imageSource);
     if (cachedBytes != null) {
-      imageWidget = Image.memory(cachedBytes, fit: BoxFit.contain);
+      return Image.memory(cachedBytes, fit: BoxFit.contain);
     } else if (imageSource.startsWith('data:image/') ||
         imageSource.contains('base64')) {
       final base64String =
@@ -1755,12 +1766,264 @@ class _AppImageWidgetState extends State<_AppImageWidget> {
       try {
         final decoded = base64Decode(base64String);
         AppImageCache.put(imageSource, decoded);
-        imageWidget = Image.memory(decoded, fit: BoxFit.contain);
+        return Image.memory(decoded, fit: BoxFit.contain);
       } catch (_) {
-        imageWidget = const Icon(Icons.broken_image_rounded, size: 40);
+        return const Icon(Icons.broken_image_rounded, size: 40);
       }
     } else {
-      imageWidget = Image.network(
+      return Image.network(
+        imageSource,
+        fit: BoxFit.contain,
+        loadingBuilder: (context, child, loadingProgress) {
+          if (loadingProgress == null) return child;
+          return Container(
+            height: 160,
+            alignment: Alignment.center,
+            child: SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+            ),
+          );
+        },
+        errorBuilder: (ctx, err, stack) =>
+            const Icon(Icons.broken_image_rounded, size: 40),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final imageWidget = _buildImageContent();
+
+    final borderColor = _isDragging
+        ? const Color(0xFF6366F1).withOpacity(0.85)
+        : (_isHovered
+            ? (isDark
+                ? Colors.white.withOpacity(0.24)
+                : Colors.black.withOpacity(0.20))
+            : (isDark
+                ? Colors.white.withOpacity(0.08)
+                : Colors.black.withOpacity(0.07)));
+
+    final cardBg = isDark ? const Color(0xFF16181D) : Colors.white;
+
+    return MouseRegion(
+      cursor:
+          _isDragging ? SystemMouseCursors.grabbing : SystemMouseCursors.grab,
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTapDown: (_) => widget.onSelect(),
+        onTap: () => widget.onShowLightbox(widget.image.url, imageWidget),
+        onSecondaryTapDown: (details) =>
+            _showContextMenu(details, widget.image.url, imageWidget),
+        onPanStart: (details) {
+          widget.onSelect();
+          setState(() => _isDragging = true);
+        },
+        onPanUpdate: (details) {
+          widget.onDragUpdate(details.delta);
+        },
+        onPanEnd: (details) {
+          setState(() => _isDragging = false);
+          widget.onDragEnd();
+        },
+        onPanCancel: () {
+          setState(() => _isDragging = false);
+          widget.onDragEnd();
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 140),
+          curve: Curves.easeOutCubic,
+          width: widget.image.width,
+          decoration: BoxDecoration(
+            color: cardBg,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: borderColor, width: 1.0),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(_isDragging
+                    ? 0.50
+                    : (_isHovered
+                        ? (isDark ? 0.35 : 0.10)
+                        : (isDark ? 0.25 : 0.05))),
+                blurRadius: _isDragging ? 24 : (_isHovered ? 16 : 8),
+                offset: Offset(0, _isDragging ? 8 : 4),
+              ),
+            ],
+          ),
+          child: Stack(
+            children: [
+              // Image content
+              ClipRRect(
+                borderRadius: BorderRadius.circular(11),
+                child: imageWidget,
+              ),
+
+              // Floating Controls Bar on Hover / Drag
+              Positioned(
+                top: 6,
+                right: 6,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 160),
+                  opacity: (_isHovered || _isDragging) ? 1.0 : 0.0,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.78),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: Colors.white.withOpacity(0.18),
+                        width: 1,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.drag_indicator_rounded,
+                          size: 15,
+                          color: Colors.white70,
+                        ),
+                        const SizedBox(width: 6),
+                        GestureDetector(
+                          onTap: () => widget.onShowLightbox(
+                              widget.image.url, imageWidget),
+                          child: const Icon(
+                            Icons.fullscreen_rounded,
+                            size: 16,
+                            color: Colors.white70,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        GestureDetector(
+                          onTap: () => widget.onDelete(),
+                          child: const Icon(
+                            Icons.close_rounded,
+                            size: 15,
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+              // Resize Handle in bottom-right corner
+              Positioned(
+                bottom: 0,
+                right: 0,
+                child: MouseRegion(
+                  cursor: SystemMouseCursors.resizeDownRight,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onPanUpdate: (details) {
+                      widget.onResize(details.delta.dx);
+                    },
+                    onPanEnd: (_) => widget.onDragEnd(),
+                    child: Container(
+                      width: 24,
+                      height: 24,
+                      alignment: Alignment.bottomRight,
+                      padding: const EdgeInsets.only(right: 3, bottom: 3),
+                      child: AnimatedOpacity(
+                        duration: const Duration(milliseconds: 160),
+                        opacity: (_isHovered || _isDragging) ? 0.9 : 0.3,
+                        child: Icon(
+                          Icons.south_east_rounded,
+                          size: 13,
+                          color: isDark ? Colors.white70 : Colors.black54,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class AppImageEmbedBuilder extends EmbedBuilder {
+  final Function(String source)? onDeleteImage;
+  final Function(String source)? onCopyImage;
+  final bool isMobile;
+
+  AppImageEmbedBuilder({
+    this.onDeleteImage,
+    this.onCopyImage,
+    this.isMobile = false,
+  });
+
+  @override
+  String get key => BlockEmbed.imageType;
+
+  @override
+  Widget build(
+    BuildContext context,
+    EmbedContext embedContext,
+  ) {
+    return _AppImageWidget(
+      embedContext: embedContext,
+      onDeleteImage: onDeleteImage,
+      onCopyImage: onCopyImage,
+      isMobile: isMobile,
+    );
+  }
+}
+
+class _AppImageWidget extends StatefulWidget {
+  final EmbedContext embedContext;
+  final Function(String source)? onDeleteImage;
+  final Function(String source)? onCopyImage;
+  final bool isMobile;
+
+  const _AppImageWidget({
+    required this.embedContext,
+    this.onDeleteImage,
+    this.onCopyImage,
+    this.isMobile = false,
+  });
+
+  @override
+  State<_AppImageWidget> createState() => _AppImageWidgetState();
+}
+
+class _AppImageWidgetState extends State<_AppImageWidget> {
+  void _deleteImage() {
+    final imageSource = widget.embedContext.node.value.data.toString();
+    widget.onDeleteImage?.call(imageSource);
+  }
+
+  Widget _buildImageContent() {
+    final imageSource = widget.embedContext.node.value.data.toString();
+    final cachedBytes = AppImageCache.get(imageSource);
+    if (cachedBytes != null) {
+      return Image.memory(cachedBytes, fit: BoxFit.contain);
+    } else if (imageSource.startsWith('data:image/') ||
+        imageSource.contains('base64')) {
+      final base64String =
+          imageSource.contains(',') ? imageSource.split(',')[1] : imageSource;
+      try {
+        final decoded = base64Decode(base64String);
+        AppImageCache.put(imageSource, decoded);
+        return Image.memory(decoded, fit: BoxFit.contain);
+      } catch (_) {
+        return const Icon(Icons.broken_image_rounded, size: 40);
+      }
+    } else {
+      return Image.network(
         imageSource,
         fit: BoxFit.contain,
         loadingBuilder: (context, child, loadingProgress) {
@@ -1782,152 +2045,25 @@ class _AppImageWidgetState extends State<_AppImageWidget> {
             const Icon(Icons.broken_image_rounded, size: 40),
       );
     }
+  }
 
-    final payload = ImageDragPayload(
-      imageSource: imageSource,
-      nodeOffset: widget.embedContext.node.documentOffset,
-    );
-
-    final displayedImage = ClipRRect(
-      borderRadius: BorderRadius.circular(12),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 520),
-        child: imageWidget,
-      ),
-    );
-
-    final feedbackWidget = Material(
-      color: Colors.transparent,
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 320, maxHeight: 200),
-        child: Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: const Color(0xFF6366F1).withOpacity(0.7),
-              width: 1.5,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withOpacity(0.45),
-                blurRadius: 20,
-                offset: const Offset(0, 8),
-              ),
-            ],
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(11),
-            child: Opacity(
-              opacity: 0.88,
-              child: imageWidget,
-            ),
-          ),
-        ),
-      ),
-    );
-
-    final childWhenDragging = Opacity(
-      opacity: 0.25,
-      child: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: const Color(0xFF6366F1).withOpacity(0.4),
-            width: 1.5,
-          ),
-        ),
-        child: displayedImage,
-      ),
-    );
-
-    final imageWithGestures = MouseRegion(
-      cursor: SystemMouseCursors.grab,
-      onEnter: (_) => setState(() => _isHovered = true),
-      onExit: (_) => setState(() => _isHovered = false),
-      child: Stack(
-        alignment: Alignment.topRight,
-        children: [
-          GestureDetector(
-            onSecondaryTapDown: (details) =>
-                _showContextMenu(details, imageSource, imageWidget),
-            onLongPressStart: (details) => _showContextMenu(
-              TapDownDetails(globalPosition: details.globalPosition),
-              imageSource,
-              imageWidget,
-            ),
-            onTap: () => _showLightbox(imageWidget, imageSource),
-            child: displayedImage,
-          ),
-          // Subtle drag indicator badge on hover
-          AnimatedOpacity(
-            duration: const Duration(milliseconds: 160),
-            opacity: _isHovered ? 1.0 : 0.0,
-            child: Container(
-              margin: const EdgeInsets.all(8),
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.72),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: Colors.white.withOpacity(0.15),
-                  width: 1,
-                ),
-              ),
-              child: const Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.drag_indicator_rounded,
-                      color: Colors.white70, size: 14),
-                  SizedBox(width: 4),
-                  Text(
-                    'Зажмите ЛКМ для перемещения',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-
-    Widget draggableItem;
-    if (widget.isMobile) {
-      draggableItem = LongPressDraggable<ImageDragPayload>(
-        data: payload,
-        dragAnchorStrategy: pointerDragAnchorStrategy,
-        feedback: feedbackWidget,
-        childWhenDragging: childWhenDragging,
-        child: imageWithGestures,
-      );
-    } else {
-      draggableItem = Draggable<ImageDragPayload>(
-        data: payload,
-        dragAnchorStrategy: pointerDragAnchorStrategy,
-        feedback: feedbackWidget,
-        childWhenDragging: childWhenDragging,
-        child: imageWithGestures,
-      );
-    }
+  @override
+  Widget build(BuildContext context) {
+    final imageSource = widget.embedContext.node.value.data.toString();
+    final imageWidget = _buildImageContent();
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Center(
-        child: TweenAnimationBuilder<double>(
-          duration: const Duration(milliseconds: 220),
-          curve: Curves.easeOutCubic,
-          tween: Tween(begin: 0.98, end: 1.0),
-          builder: (context, scale, child) {
-            return Transform.scale(
-              scale: scale,
-              child: child,
-            );
-          },
-          child: draggableItem,
+        child: GestureDetector(
+          onTap: () => ImageActions.showLightbox(context, imageWidget, imageSource),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 520),
+              child: imageWidget,
+            ),
+          ),
         ),
       ),
     );
@@ -1965,7 +2101,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
   final FocusNode _editorFocusNode = FocusNode();
   final ScrollController _editorScrollController = ScrollController();
   final GlobalKey<EditorState> _editorKey = GlobalKey<EditorState>();
-  int? _activeDropTargetOffset;
+  List<CanvasImage> _canvasImages = [];
   StreamSubscription? _docChangeSub;
   Timer? _debounceTimer;
 
@@ -2030,10 +2166,34 @@ class _NoteEditorViewState extends State<NoteEditorView>
     if (widget.note.content.isNotEmpty) {
       try {
         final decoded = jsonDecode(widget.note.content);
-        if (decoded is List) {
-          doc = Document.fromJson(decoded);
-        } else if (decoded is Map && decoded['delta'] is List) {
+        if (decoded is Map && decoded['delta'] is List) {
           doc = Document.fromJson(decoded['delta']);
+          if (decoded['images'] is List) {
+            _canvasImages = (decoded['images'] as List)
+                .map((e) => CanvasImage.fromJson(Map<String, dynamic>.from(e)))
+                .toList();
+          }
+        } else if (decoded is List) {
+          final textOps = <Map<String, dynamic>>[];
+          double initialY = 20.0;
+          for (final op in decoded) {
+            if (op is Map &&
+                op['insert'] is Map &&
+                op['insert']['image'] != null) {
+              _canvasImages.add(CanvasImage(
+                id: 'img_${DateTime.now().microsecondsSinceEpoch}_${_canvasImages.length}',
+                url: op['insert']['image'].toString(),
+                x: 20.0,
+                y: initialY,
+                width: 320.0,
+              ));
+              initialY += 240.0;
+            } else {
+              textOps.add(Map<String, dynamic>.from(op));
+            }
+          }
+          doc = Document.fromJson(
+              textOps.isNotEmpty ? textOps : [{'insert': '\n'}]);
         } else {
           doc = Document();
         }
@@ -2212,13 +2372,43 @@ class _NoteEditorViewState extends State<NoteEditorView>
       try {
         final decoded = jsonDecode(remoteContent);
         Document newDoc;
-        if (decoded is List) {
-          newDoc = Document.fromJson(decoded);
-        } else if (decoded is Map && decoded['delta'] is List) {
+        List<CanvasImage> newImages = _canvasImages;
+        if (decoded is Map && decoded['delta'] is List) {
           newDoc = Document.fromJson(decoded['delta']);
+          if (decoded['images'] is List) {
+            newImages = (decoded['images'] as List)
+                .map((e) => CanvasImage.fromJson(Map<String, dynamic>.from(e)))
+                .toList();
+          }
+        } else if (decoded is List) {
+          final textOps = <Map<String, dynamic>>[];
+          final extracted = <CanvasImage>[];
+          double curY = 20.0;
+          for (final op in decoded) {
+            if (op is Map &&
+                op['insert'] is Map &&
+                op['insert']['image'] != null) {
+              extracted.add(CanvasImage(
+                id: 'img_${DateTime.now().microsecondsSinceEpoch}_${extracted.length}',
+                url: op['insert']['image'].toString(),
+                x: 20.0,
+                y: curY,
+                width: 320.0,
+              ));
+              curY += 240.0;
+            } else {
+              textOps.add(Map<String, dynamic>.from(op));
+            }
+          }
+          newDoc = Document.fromJson(
+              textOps.isNotEmpty ? textOps : [{'insert': '\n'}]);
+          if (extracted.isNotEmpty) {
+            newImages = extracted;
+          }
         } else {
           newDoc = Document();
         }
+        _canvasImages = newImages;
         final oldSelection = _quillController.selection;
         _setQuillDocument(newDoc);
         final newLen = _quillController.document.length;
@@ -2264,7 +2454,10 @@ class _NoteEditorViewState extends State<NoteEditorView>
 
   Future<void> _saveNote({bool force = false}) async {
     final title = _titleController.text.trim();
-    final content = jsonEncode(_quillController.document.toDelta().toJson());
+    final content = jsonEncode({
+      'delta': _quillController.document.toDelta().toJson(),
+      'images': _canvasImages.map((e) => e.toJson()).toList(),
+    });
 
     // Never save temporary data:image
     if (content.contains('data:image/')) {
@@ -2488,64 +2681,6 @@ class _NoteEditorViewState extends State<NoteEditorView>
     widget.onBroadcastSync?.call();
   }
 
-  void _handleAutoScrollOnDrag(Offset globalPosition) {
-    if (!_editorScrollController.hasClients) return;
-    final RenderBox? box = context.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final local = box.globalToLocal(globalPosition);
-    final height = box.size.height;
-    const threshold = 70.0;
-    const step = 16.0;
-
-    if (local.dy < threshold) {
-      final newOffset = (_editorScrollController.offset - step)
-          .clamp(0.0, _editorScrollController.position.maxScrollExtent);
-      _editorScrollController.jumpTo(newOffset);
-    } else if (local.dy > height - threshold) {
-      final newOffset = (_editorScrollController.offset + step)
-          .clamp(0.0, _editorScrollController.position.maxScrollExtent);
-      _editorScrollController.jumpTo(newOffset);
-    }
-  }
-
-  Widget _buildDropIndicator() {
-    if (_activeDropTargetOffset == null) return const SizedBox.shrink();
-    final renderEditor = _editorKey.currentState?.renderEditor;
-    if (renderEditor == null) return const SizedBox.shrink();
-
-    try {
-      final docLen = _quillController.document.length;
-      final safeOffset = _activeDropTargetOffset!.clamp(0, docLen - 1);
-      final rect = renderEditor.getLocalRectForCaret(
-        TextPosition(offset: safeOffset),
-      );
-      return Positioned(
-        top: rect.bottom + 1,
-        left: 0,
-        right: 0,
-        child: IgnorePointer(
-          child: Container(
-            height: 2.5,
-            margin: const EdgeInsets.symmetric(horizontal: 4),
-            decoration: BoxDecoration(
-              color: const Color(0xFF6366F1),
-              borderRadius: BorderRadius.circular(2),
-              boxShadow: [
-                BoxShadow(
-                  color: const Color(0xFF6366F1).withOpacity(0.85),
-                  blurRadius: 8,
-                  spreadRadius: 1,
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
-    } catch (_) {
-      return const SizedBox.shrink();
-    }
-  }
-
   Future<void> _insertImageBytes(Uint8List bytes) async {
     final now = DateTime.now();
     if (_isInsertingImage ||
@@ -2556,49 +2691,28 @@ class _NoteEditorViewState extends State<NoteEditorView>
     _lastImageInsertTime = now;
 
     try {
-      final index = _quillController.selection.baseOffset;
-      final length = _quillController.selection.extentOffset - index;
-      final safeIndex =
-          index < 0 ? _quillController.document.length - 1 : index;
-      final safeLength = length < 0 ? 0 : length;
-
       final optimized = await _optimizeImageBytes(bytes);
       final tempBase64 = base64Encode(optimized);
       final localDataUrl = 'data:image/jpeg;base64,$tempBase64';
 
       AppImageCache.put(localDataUrl, optimized);
 
-      final plainText = _quillController.document.toPlainText();
-      final needsLeadingNewline = safeIndex > 0 &&
-          safeIndex <= plainText.length &&
-          plainText[safeIndex - 1] != '\n';
+      final imgId = 'img_${DateTime.now().millisecondsSinceEpoch}';
+      final currentScroll = _editorScrollController.hasClients
+          ? _editorScrollController.offset
+          : 0.0;
 
-      int currentPos = safeIndex;
-
-      // Newline before image if not already at line start
-      if (needsLeadingNewline) {
-        _quillController.replaceText(currentPos, 0, '\n', null);
-        currentPos += 1;
-      }
-
-      // Insert image block
-      _quillController.replaceText(
-        currentPos,
-        safeLength,
-        BlockEmbed.image(localDataUrl),
-        null,
+      final newImage = CanvasImage(
+        id: imgId,
+        url: localDataUrl,
+        x: 20.0,
+        y: currentScroll + 20.0,
+        width: 340.0,
       );
-      currentPos += 1;
 
-      // Always insert newline after the image so cursor jumps to the next line below
-      _quillController.replaceText(currentPos, 0, '\n', null);
-      currentPos += 1;
-
-      // Place cursor neatly on the fresh new line below the image
-      _quillController.updateSelection(
-        TextSelection.collapsed(offset: currentPos),
-        ChangeSource.local,
-      );
+      setState(() {
+        _canvasImages.add(newImage);
+      });
 
       _debounceTimer?.cancel();
       _lastLocalEditTime = DateTime.now();
@@ -2609,8 +2723,11 @@ class _NoteEditorViewState extends State<NoteEditorView>
         final cloudUrl = await _uploadImageToStorage(optimized);
         if (cloudUrl != null && mounted) {
           AppImageCache.put(cloudUrl, optimized);
-          _replaceImageSourceInDocument(localDataUrl, cloudUrl);
-          await _saveNote(force: true);
+          final idx = _canvasImages.indexWhere((img) => img.id == imgId);
+          if (idx != -1) {
+            _canvasImages[idx].url = cloudUrl;
+            await _saveNote(force: true);
+          }
         }
       } catch (e) {
         debugPrint('Image upload error: $e');
@@ -2746,163 +2863,140 @@ class _NoteEditorViewState extends State<NoteEditorView>
               ? Colors.white.withOpacity(0.07)
               : Colors.black.withOpacity(0.06),
         ),
-                    DragTarget<ImageDragPayload>(
-                      onWillAcceptWithDetails: (details) => true,
-                      onMove: (details) {
-                        final renderEditor =
-                            _editorKey.currentState?.renderEditor;
-                        if (renderEditor != null) {
-                          final pos = renderEditor
-                              .getPositionForOffset(details.offset);
-                          if (_activeDropTargetOffset != pos.offset) {
-                            setState(() {
-                              _activeDropTargetOffset = pos.offset;
-                            });
-                            _quillController.updateSelection(
-                              TextSelection.collapsed(offset: pos.offset),
-                              ChangeSource.local,
-                            );
-                          }
-                        }
-                        _handleAutoScrollOnDrag(details.offset);
-                      },
-                      onLeave: (data) {
-                        if (_activeDropTargetOffset != null) {
-                          setState(() {
-                            _activeDropTargetOffset = null;
-                          });
-                        }
-                      },
-                      onAcceptWithDetails: (details) {
-                        final target = _activeDropTargetOffset;
-                        setState(() {
-                          _activeDropTargetOffset = null;
-                        });
-                        if (target != null) {
-                          _moveImageInDocument(
-                              details.data.imageSource, target);
-                        }
-                      },
-                      builder: (context, candidateData, rejectedData) {
-                        return Stack(
-                          clipBehavior: Clip.none,
-                          children: [
-                            QuillEditor(
-                              controller: _quillController,
-                              focusNode: _editorFocusNode,
-                              scrollController: _editorScrollController,
-                              config: QuillEditorConfig(
-                                editorKey: _editorKey,
-                                scrollable: false,
-                                autoFocus: false,
-                                expands: false,
-                                padding: EdgeInsets.zero,
-                                showCursor: true,
-                                detectWordBoundary: false,
-                                embedBuilders: [
-                                  AppImageEmbedBuilder(
-                                    isMobile: widget.isMobile,
-                                    onDeleteImage: (src) {
-                                      _replaceImageSourceInDocument(src, '');
-                                      _saveNote(force: true);
-                                    },
-                                  ),
-                                ],
-                                customStyles: DefaultStyles(
-                                  paragraph: DefaultTextBlockStyle(
-                                    TextStyle(
-                                      fontSize: 16,
-                                      height: 1.7,
-                                      color: theme.colorScheme.onSurface,
-                                    ),
-                                    const HorizontalSpacing(0, 0),
-                                    const VerticalSpacing(0, 4),
-                                    const VerticalSpacing(0, 0),
-                                    null,
-                                  ),
-                                  h1: DefaultTextBlockStyle(
-                                    TextStyle(
-                                      fontSize: 24,
-                                      fontWeight: FontWeight.w700,
-                                      height: 1.4,
-                                      color: theme.colorScheme.onSurface,
-                                    ),
-                                    const HorizontalSpacing(0, 0),
-                                    const VerticalSpacing(16, 6),
-                                    const VerticalSpacing(0, 0),
-                                    null,
-                                  ),
-                                  h2: DefaultTextBlockStyle(
-                                    TextStyle(
-                                      fontSize: 20,
-                                      fontWeight: FontWeight.w700,
-                                      height: 1.4,
-                                      color: theme.colorScheme.onSurface,
-                                    ),
-                                    const HorizontalSpacing(0, 0),
-                                    const VerticalSpacing(14, 4),
-                                    const VerticalSpacing(0, 0),
-                                    null,
-                                  ),
-                                  code: DefaultTextBlockStyle(
-                                    TextStyle(
-                                      fontFamily: 'monospace',
-                                      fontSize: 13,
-                                      color: isDark
-                                          ? const Color(0xFFE2E8F0)
-                                          : const Color(0xFF1E293B),
-                                    ),
-                                    const HorizontalSpacing(0, 0),
-                                    const VerticalSpacing(8, 8),
-                                    const VerticalSpacing(0, 0),
-                                    BoxDecoration(
-                                      color: isDark
-                                          ? const Color(0xFF16181D)
-                                          : const Color(0xFFF1F3F5),
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                  ),
-                                  quote: DefaultTextBlockStyle(
-                                    TextStyle(
-                                      fontSize: 15,
-                                      fontStyle: FontStyle.italic,
-                                      color: theme.colorScheme.onSurfaceVariant,
-                                    ),
-                                    const HorizontalSpacing(0, 0),
-                                    const VerticalSpacing(6, 6),
-                                    const VerticalSpacing(0, 0),
-                                    BoxDecoration(
-                                      border: Border(
-                                        left: BorderSide(
-                                          color: theme.colorScheme.primary,
-                                          width: 3,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                  placeHolder: DefaultTextBlockStyle(
-                                    TextStyle(
-                                      fontSize: 16,
-                                      height: 1.7,
-                                      color: theme.colorScheme.onSurfaceVariant
-                                          .withAlpha(120),
-                                    ),
-                                    const HorizontalSpacing(0, 0),
-                                    const VerticalSpacing(0, 0),
-                                    const VerticalSpacing(0, 0),
-                                    null,
-                                  ),
-                                ),
-                                placeholder:
-                                    'Начните писать или нажмите / для выбора команд...',
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final availableWidth = constraints.maxWidth;
+            double maxImageBottom = 300.0;
+            for (final img in _canvasImages) {
+              final b = img.y + (img.height ?? (img.width * 0.75));
+              if (b > maxImageBottom) maxImageBottom = b;
+            }
+
+            return Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Container(
+                  constraints: BoxConstraints(
+                    minHeight: max(400.0, maxImageBottom + 120.0),
+                  ),
+                  child: QuillEditor(
+                    controller: _quillController,
+                    focusNode: _editorFocusNode,
+                    scrollController: _editorScrollController,
+                    config: QuillEditorConfig(
+                      editorKey: _editorKey,
+                      scrollable: false,
+                      autoFocus: false,
+                      expands: false,
+                      padding: EdgeInsets.zero,
+                      showCursor: true,
+                      detectWordBoundary: false,
+                      embedBuilders: [
+                        AppImageEmbedBuilder(
+                          isMobile: widget.isMobile,
+                          onDeleteImage: (src) {
+                            _replaceImageSourceInDocument(src, '');
+                            _saveNote(force: true);
+                          },
+                        ),
+                      ],
+                      customStyles: DefaultStyles(
+                        paragraph: DefaultTextBlockStyle(
+                          TextStyle(
+                            fontSize: 16,
+                            height: 1.7,
+                            color: theme.colorScheme.onSurface,
+                          ),
+                          const HorizontalSpacing(0, 0),
+                          const VerticalSpacing(0, 4),
+                          const VerticalSpacing(0, 0),
+                          null,
+                        ),
+                        h1: DefaultTextBlockStyle(
+                          TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.w700,
+                            height: 1.4,
+                            color: theme.colorScheme.onSurface,
+                          ),
+                          const HorizontalSpacing(0, 0),
+                          const VerticalSpacing(16, 6),
+                          const VerticalSpacing(0, 0),
+                          null,
+                        ),
+                        h2: DefaultTextBlockStyle(
+                          TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w700,
+                            height: 1.4,
+                            color: theme.colorScheme.onSurface,
+                          ),
+                          const HorizontalSpacing(0, 0),
+                          const VerticalSpacing(14, 4),
+                          const VerticalSpacing(0, 0),
+                          null,
+                        ),
+                        code: DefaultTextBlockStyle(
+                          TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 13,
+                            color: isDark
+                                ? const Color(0xFFE2E8F0)
+                                : const Color(0xFF1E293B),
+                          ),
+                          const HorizontalSpacing(0, 0),
+                          const VerticalSpacing(8, 8),
+                          const VerticalSpacing(0, 0),
+                          BoxDecoration(
+                            color: isDark
+                                ? const Color(0xFF16181D)
+                                : const Color(0xFFF1F3F5),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                        ),
+                        quote: DefaultTextBlockStyle(
+                          TextStyle(
+                            fontSize: 15,
+                            fontStyle: FontStyle.italic,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                          const HorizontalSpacing(0, 0),
+                          const VerticalSpacing(6, 6),
+                          const VerticalSpacing(0, 0),
+                          BoxDecoration(
+                            border: Border(
+                              left: BorderSide(
+                                color: theme.colorScheme.primary,
+                                width: 3,
                               ),
                             ),
-                            _buildDropIndicator(),
-                          ],
-                        );
-                      },
+                          ),
+                        ),
+                        placeHolder: DefaultTextBlockStyle(
+                          TextStyle(
+                            fontSize: 16,
+                            height: 1.7,
+                            color: theme.colorScheme.onSurfaceVariant
+                                .withAlpha(120),
+                          ),
+                          const HorizontalSpacing(0, 0),
+                          const VerticalSpacing(0, 0),
+                          const VerticalSpacing(0, 0),
+                          null,
+                        ),
+                      ),
+                      placeholder:
+                          'Начните писать или нажмите / для выбора команд...',
                     ),
-                    const SizedBox(height: 120),
+                  ),
+                ),
+                for (int i = 0; i < _canvasImages.length; i++)
+                  _buildPositionedCanvasImage(_canvasImages[i], availableWidth),
+              ],
+            );
+          },
+        ),
+        const SizedBox(height: 120),
                   ],
                 );
 
@@ -2991,6 +3085,82 @@ class _NoteEditorViewState extends State<NoteEditorView>
           ),
       ],
     );
+  }
+
+  Widget _buildPositionedCanvasImage(CanvasImage img, double availableWidth) {
+    final maxX = max(0.0, availableWidth - img.width);
+    final clampedX = img.x.clamp(0.0, maxX);
+    final clampedY = max(0.0, img.y);
+
+    return Positioned(
+      left: clampedX,
+      top: clampedY,
+      child: _CanvasImageWidget(
+        key: ValueKey(img.id),
+        image: img,
+        maxWidth: availableWidth,
+        isMobile: widget.isMobile,
+        onSelect: () {
+          setState(() {
+            _canvasImages.remove(img);
+            _canvasImages.add(img);
+          });
+        },
+        onDragUpdate: (delta) {
+          setState(() {
+            img.x = (img.x + delta.dx).clamp(0.0, maxX);
+            img.y = max(0.0, img.y + delta.dy);
+          });
+          _handleAutoScrollOnCanvasDrag(img.y);
+        },
+        onDragEnd: () {
+          _lastLocalEditTime = DateTime.now();
+          _isSavedNotifier.value = false;
+          _isSavingNotifier.value = true;
+          _saveNote(force: true);
+          widget.onBroadcastSync?.call();
+        },
+        onResize: (deltaWidth) {
+          setState(() {
+            img.width = (img.width + deltaWidth).clamp(160.0, availableWidth);
+            img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
+          });
+        },
+        onDelete: () {
+          setState(() {
+            _canvasImages.remove(img);
+          });
+          _lastLocalEditTime = DateTime.now();
+          _saveNote(force: true);
+          widget.onBroadcastSync?.call();
+        },
+        onCopy: (src) {
+          ImageActions.copyImage(context, src);
+        },
+        onShowLightbox: (src, imageWidget) {
+          ImageActions.showLightbox(context, imageWidget, src);
+        },
+      ),
+    );
+  }
+
+  void _handleAutoScrollOnCanvasDrag(double imageY) {
+    if (!_editorScrollController.hasClients) return;
+    final currentScroll = _editorScrollController.offset;
+    final viewportHeight = _editorScrollController.position.viewportDimension;
+    const threshold = 80.0;
+    const step = 16.0;
+
+    final screenY = imageY - currentScroll;
+    if (screenY < threshold && currentScroll > 0) {
+      final target = (currentScroll - step)
+          .clamp(0.0, _editorScrollController.position.maxScrollExtent);
+      _editorScrollController.jumpTo(target);
+    } else if (screenY > viewportHeight - threshold) {
+      final target = (currentScroll + step)
+          .clamp(0.0, _editorScrollController.position.maxScrollExtent);
+      _editorScrollController.jumpTo(target);
+    }
   }
 
   Widget _buildStatusDot() {

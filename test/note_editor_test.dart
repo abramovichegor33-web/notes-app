@@ -89,8 +89,13 @@ void main() {
 
     await tester.pumpAndSettle();
     expect(find.text('Image Note'), findsOneWidget);
-    expect(find.byType(Draggable<ImageDragPayload>), findsOneWidget);
-    expect(find.byType(DragTarget<ImageDragPayload>), findsOneWidget);
+    final canvasImageFinder = find.byWidgetPredicate(
+        (w) => w.runtimeType.toString() == '_CanvasImageWidget');
+    expect(canvasImageFinder, findsOneWidget);
+
+    // Freeform drag test: drag image by (60, 40)
+    await tester.drag(canvasImageFinder, const Offset(60, 40));
+    await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
 
