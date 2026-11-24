@@ -1655,7 +1655,7 @@ class _CanvasImageWidget extends StatefulWidget {
   final VoidCallback onSelect;
   final Function(Offset delta) onDragUpdate;
   final VoidCallback onDragEnd;
-  final Function(Offset delta) onResize;
+  final Function(Offset delta, String edge) onResizeEdge;
   final Function(double factor) onScaleStep;
   final VoidCallback onResetScale;
   final VoidCallback onDelete;
@@ -1671,7 +1671,7 @@ class _CanvasImageWidget extends StatefulWidget {
     required this.onSelect,
     required this.onDragUpdate,
     required this.onDragEnd,
-    required this.onResize,
+    required this.onResizeEdge,
     required this.onScaleStep,
     required this.onResetScale,
     required this.onDelete,
@@ -1687,6 +1687,7 @@ class _CanvasImageWidget extends StatefulWidget {
 class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
   bool _isHovered = false;
   bool _isDragging = false;
+  bool _isResizing = false;
 
   @override
   void initState() {
@@ -1939,7 +1940,7 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final imageWidget = _buildImageContent();
 
-    final borderColor = _isDragging
+    final borderColor = (_isDragging || _isResizing)
         ? const Color(0xFF6366F1).withOpacity(0.85)
         : (_isHovered
             ? (isDark
@@ -2134,29 +2135,195 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
                 ),
               ),
 
-              // Resize Handle in bottom-right corner with aspect-ratio diagonal grip
+              // --- Edge & Corner Resize Handles ---
+
+              // 1. Right Edge Resize Handle
+              Positioned(
+                top: 20,
+                bottom: 28,
+                right: 0,
+                width: 14,
+                child: MouseRegion(
+                  cursor: SystemMouseCursors.resizeLeftRight,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onPanStart: (_) {
+                      widget.onSelect();
+                      setState(() => _isResizing = true);
+                    },
+                    onPanUpdate: (details) {
+                      widget.onResizeEdge(details.delta, 'right');
+                    },
+                    onPanEnd: (_) {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
+                    onPanCancel: () {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
+                    child: Center(
+                      child: AnimatedOpacity(
+                        duration: const Duration(milliseconds: 160),
+                        opacity: (_isHovered || _isResizing) ? 0.90 : 0.0,
+                        child: Container(
+                          width: 4,
+                          height: 32,
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? Colors.white.withOpacity(0.55)
+                                : Colors.black.withOpacity(0.45),
+                            borderRadius: BorderRadius.circular(2),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.3),
+                                blurRadius: 4,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              // 2. Bottom Edge Resize Handle
+              Positioned(
+                left: 28,
+                right: 28,
+                bottom: 0,
+                height: 14,
+                child: MouseRegion(
+                  cursor: SystemMouseCursors.resizeUpDown,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onPanStart: (_) {
+                      widget.onSelect();
+                      setState(() => _isResizing = true);
+                    },
+                    onPanUpdate: (details) {
+                      widget.onResizeEdge(details.delta, 'bottom');
+                    },
+                    onPanEnd: (_) {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
+                    onPanCancel: () {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
+                    child: Center(
+                      child: AnimatedOpacity(
+                        duration: const Duration(milliseconds: 160),
+                        opacity: (_isHovered || _isResizing) ? 0.90 : 0.0,
+                        child: Container(
+                          width: 32,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? Colors.white.withOpacity(0.55)
+                                : Colors.black.withOpacity(0.45),
+                            borderRadius: BorderRadius.circular(2),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.3),
+                                blurRadius: 4,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              // 3. Left Edge Resize Handle
+              Positioned(
+                top: 20,
+                bottom: 28,
+                left: 0,
+                width: 14,
+                child: MouseRegion(
+                  cursor: SystemMouseCursors.resizeLeftRight,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onPanStart: (_) {
+                      widget.onSelect();
+                      setState(() => _isResizing = true);
+                    },
+                    onPanUpdate: (details) {
+                      widget.onResizeEdge(details.delta, 'left');
+                    },
+                    onPanEnd: (_) {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
+                    onPanCancel: () {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
+                    child: Center(
+                      child: AnimatedOpacity(
+                        duration: const Duration(milliseconds: 160),
+                        opacity: (_isHovered || _isResizing) ? 0.90 : 0.0,
+                        child: Container(
+                          width: 4,
+                          height: 32,
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? Colors.white.withOpacity(0.55)
+                                : Colors.black.withOpacity(0.45),
+                            borderRadius: BorderRadius.circular(2),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.3),
+                                blurRadius: 4,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              // 4. Bottom-Right Corner Resize Grip
               Positioned(
                 bottom: 0,
                 right: 0,
+                width: 28,
+                height: 28,
                 child: MouseRegion(
                   cursor: SystemMouseCursors.resizeDownRight,
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onPanUpdate: (details) {
-                      widget.onResize(details.delta);
+                    onPanStart: (_) {
+                      widget.onSelect();
+                      setState(() => _isResizing = true);
                     },
-                    onPanEnd: (_) => widget.onDragEnd(),
+                    onPanUpdate: (details) {
+                      widget.onResizeEdge(details.delta, 'bottom_right');
+                    },
+                    onPanEnd: (_) {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
+                    onPanCancel: () {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
                     child: Container(
-                      width: 28,
-                      height: 28,
                       alignment: Alignment.bottomRight,
-                      padding: const EdgeInsets.only(right: 4, bottom: 4),
+                      padding: const EdgeInsets.only(right: 3, bottom: 3),
                       child: AnimatedOpacity(
                         duration: const Duration(milliseconds: 160),
-                        opacity: (_isHovered || _isDragging) ? 0.95 : 0.35,
+                        opacity: (_isHovered || _isResizing) ? 0.95 : 0.35,
                         child: Container(
                           decoration: BoxDecoration(
-                            color: (_isHovered || _isDragging)
+                            color: (_isHovered || _isResizing)
                                 ? Colors.black.withOpacity(0.65)
                                 : Colors.transparent,
                             borderRadius: const BorderRadius.only(
@@ -2167,6 +2334,60 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
                           padding: const EdgeInsets.all(2),
                           child: Icon(
                             Icons.south_east_rounded,
+                            size: 14,
+                            color: isDark ? Colors.white70 : Colors.black54,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              // 5. Bottom-Left Corner Resize Grip
+              Positioned(
+                bottom: 0,
+                left: 0,
+                width: 28,
+                height: 28,
+                child: MouseRegion(
+                  cursor: SystemMouseCursors.resizeDownLeft,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onPanStart: (_) {
+                      widget.onSelect();
+                      setState(() => _isResizing = true);
+                    },
+                    onPanUpdate: (details) {
+                      widget.onResizeEdge(details.delta, 'bottom_left');
+                    },
+                    onPanEnd: (_) {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
+                    onPanCancel: () {
+                      setState(() => _isResizing = false);
+                      widget.onDragEnd();
+                    },
+                    child: Container(
+                      alignment: Alignment.bottomLeft,
+                      padding: const EdgeInsets.only(left: 3, bottom: 3),
+                      child: AnimatedOpacity(
+                        duration: const Duration(milliseconds: 160),
+                        opacity: (_isHovered || _isResizing) ? 0.95 : 0.0,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: (_isHovered || _isResizing)
+                                ? Colors.black.withOpacity(0.65)
+                                : Colors.transparent,
+                            borderRadius: const BorderRadius.only(
+                              topRight: Radius.circular(6),
+                              bottomLeft: Radius.circular(10),
+                            ),
+                          ),
+                          padding: const EdgeInsets.all(2),
+                          child: Icon(
+                            Icons.south_west_rounded,
                             size: 14,
                             color: isDark ? Colors.white70 : Colors.black54,
                           ),
@@ -3419,22 +3640,53 @@ class _NoteEditorViewState extends State<NoteEditorView>
           _saveNote(force: true);
           widget.onBroadcastSync?.call();
         },
-        onResize: (delta) {
+        onResizeEdge: (delta, edge) {
           setState(() {
             final ar = img.aspectRatio ??
                 ((img.height != null && img.height! > 0)
                     ? (img.width / img.height!)
                     : 1.0);
-            final diagonalProj = (delta.dx * ar + delta.dy) / (ar * ar + 1.0);
-            final deltaW = diagonalProj * ar;
-
             final minW = max(80.0, min(140.0, availableWidth * 0.2));
             final maxW = availableWidth;
 
-            final newWidth = (img.width + deltaW).clamp(minW, maxW);
-            img.width = newWidth;
-            img.height = newWidth / ar;
-            img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
+            if (edge == 'right') {
+              final newWidth = (img.width + delta.dx).clamp(minW, maxW);
+              img.width = newWidth;
+              img.height = newWidth / ar;
+              img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
+            } else if (edge == 'bottom') {
+              final deltaW = delta.dy * ar;
+              final newWidth = (img.width + deltaW).clamp(minW, maxW);
+              img.width = newWidth;
+              img.height = newWidth / ar;
+              img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
+            } else if (edge == 'bottom_right') {
+              final diagonalProj =
+                  (delta.dx * ar + delta.dy) / (ar * ar + 1.0);
+              final deltaW = diagonalProj * ar;
+              final newWidth = (img.width + deltaW).clamp(minW, maxW);
+              img.width = newWidth;
+              img.height = newWidth / ar;
+              img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
+            } else if (edge == 'left') {
+              final deltaW = -delta.dx;
+              final newWidth = (img.width + deltaW).clamp(minW, maxW);
+              final actualDeltaW = newWidth - img.width;
+              img.width = newWidth;
+              img.height = newWidth / ar;
+              img.x = (img.x - actualDeltaW)
+                  .clamp(0.0, max(0.0, availableWidth - img.width));
+            } else if (edge == 'bottom_left') {
+              final diagonalProj =
+                  (-delta.dx * ar + delta.dy) / (ar * ar + 1.0);
+              final deltaW = diagonalProj * ar;
+              final newWidth = (img.width + deltaW).clamp(minW, maxW);
+              final actualDeltaW = newWidth - img.width;
+              img.width = newWidth;
+              img.height = newWidth / ar;
+              img.x = (img.x - actualDeltaW)
+                  .clamp(0.0, max(0.0, availableWidth - img.width));
+            }
           });
         },
         onScaleStep: (factor) {
