@@ -1,10 +1,13 @@
+import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'note_model.dart';
 
 class VaultService {
   static const _key = 'user_vault_id';
   static const _themeKey = 'app_theme_mode';
+  static const _notesCachePrefix = 'cached_notes_';
 
   static Future<String> getOrCreateVaultId() async {
     final prefs = await SharedPreferences.getInstance();
@@ -19,6 +22,30 @@ class VaultService {
   static Future<void> setVaultId(String vaultId) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_key, vaultId.trim().toUpperCase());
+  }
+
+  static Future<List<Note>> getCachedNotes(String vaultId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('$_notesCachePrefix$vaultId');
+      if (raw == null || raw.isEmpty) return [];
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return [];
+      return decoded
+          .whereType<Map>()
+          .map((e) => Note.fromMap(e))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static Future<void> saveCachedNotes(String vaultId, List<Note> notes) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final payload = jsonEncode(notes.map((n) => n.toCacheMap()).toList());
+      await prefs.setString('$_notesCachePrefix$vaultId', payload);
+    } catch (_) {}
   }
 
   static Future<ThemeMode> getThemeMode() async {

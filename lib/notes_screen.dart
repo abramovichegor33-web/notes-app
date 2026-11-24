@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:ui';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -46,6 +47,15 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   RealtimeChannel? _realtimeChannel;
   Timer? _periodicSyncTimer;
   Timer? _incomingSyncDebounce;
+  final Map<String, DateTime> _lastLocalEditAt = {};
+
+  SupabaseClient? _supabaseOrNull() {
+    try {
+      return Supabase.instance.client;
+    } catch (_) {
+      return null;
+    }
+  }
 
   @override
   void initState() {
@@ -83,7 +93,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
 
   void _startPeriodicSync() {
     _periodicSyncTimer?.cancel();
-    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+    _periodicSyncTimer = Timer.periodic(const Duration(seconds: 8), (_) {
       _syncFromCloudSilently();
     });
   }
@@ -110,13 +120,20 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   }
 
   void _setupRealtime() {
+    final client = _supabaseOrNull();
+    if (client == null) return;
     _realtimeChannel?.unsubscribe();
-    _realtimeChannel = Supabase.instance.client
+    _realtimeChannel = client
         .channel('notes_vault_${widget.vaultId}')
         .onPostgresChanges(
           event: PostgresChangeEvent.all,
           schema: 'public',
           table: 'notes',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'vault_id',
+            value: widget.vaultId,
+          ),
           callback: (_) {
             _onRemoteSyncSignal();
           },
@@ -145,8 +162,11 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _syncFromCloudSilently() async {
+    final client = _supabaseOrNull();
+    if (client == null) return;
+    final syncStartedAt = DateTime.now();
     try {
-      final response = await Supabase.instance.client
+      final response = await client
           .from('notes')
           .select()
           .eq('vault_id', widget.vaultId)
@@ -157,14 +177,47 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
 
       if (!mounted) return;
 
-      bool hasChanges = false;
-      if (cloudNotes.length != _notes.length) {
-        hasChanges = true;
-      } else {
-        for (int i = 0; i < cloudNotes.length; i++) {
-          if (cloudNotes[i].id != _notes[i].id ||
-              cloudNotes[i].title != _notes[i].title ||
-              cloudNotes[i].content != _notes[i].content) {
+      // Preserve any fresh local edits that happened after this sync started
+      final mergedNotes = <Note>[];
+      for (final remoteNote in cloudNotes) {
+        final lastEdit = _lastLocalEditAt[remoteNote.id];
+        final isFreshLocalEdit = lastEdit != null &&
+            lastEdit.isAfter(syncStartedAt.subtract(const Duration(seconds: 2)));
+        if (isFreshLocalEdit) {
+          final existingIdx = _notes.indexWhere((n) => n.id == remoteNote.id);
+          if (existingIdx != -1) {
+            mergedNotes.add(_notes[existingIdx]);
+            continue;
+          }
+        }
+        mergedNotes.add(remoteNote);
+      }
+
+      // Reconcile cloud pin state if explicit 'is_pinned' exists in note content
+      final nextPinnedIds = Set<String>.from(_pinnedNoteIds);
+      bool pinnedChanged = false;
+      for (final n in mergedNotes) {
+        final parsed = parseNoteContent(n.content);
+        if (parsed.isPinned != null) {
+          if (parsed.isPinned! && !nextPinnedIds.contains(n.id)) {
+            nextPinnedIds.add(n.id);
+            pinnedChanged = true;
+          } else if (!parsed.isPinned! && nextPinnedIds.contains(n.id)) {
+            nextPinnedIds.remove(n.id);
+            pinnedChanged = true;
+          }
+        }
+      }
+
+      final localById = {for (final n in _notes) n.id: n};
+      bool hasChanges = pinnedChanged || mergedNotes.length != _notes.length;
+      if (!hasChanges) {
+        for (final remote in mergedNotes) {
+          final local = localById[remote.id];
+          if (local == null ||
+              local.title != remote.title ||
+              local.content != remote.content ||
+              local.isPinned != remote.isPinned) {
             hasChanges = true;
             break;
           }
@@ -172,29 +225,30 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
       }
 
       if (hasChanges) {
-        _notes = cloudNotes;
-        _notesNotifier.value = List.of(_notes);
-
-        if (_selectedNote != null) {
-          final match = _notes.where((n) => n.id == _selectedNote!.id);
-          if (match.isNotEmpty) {
-            final remoteNote = match.first;
-            if (remoteNote.title != _selectedNote!.title ||
-                remoteNote.content != _selectedNote!.content) {
-              setState(() {
-                _selectedNote = remoteNote;
-              });
-            }
-          } else {
-            setState(() {
-              _selectedNote = _notes.isNotEmpty ? _notes.first : null;
-            });
+        setState(() {
+          if (pinnedChanged) {
+            _pinnedNoteIds = nextPinnedIds;
           }
-        } else if (_notes.isNotEmpty) {
-          setState(() {
+          _notes = mergedNotes;
+          _notesNotifier.value = List.of(_notes);
+
+          if (_selectedNote != null) {
+            final match = _notes.where((n) => n.id == _selectedNote!.id);
+            if (match.isNotEmpty) {
+              final remoteNote = match.first;
+              if (remoteNote.title != _selectedNote!.title ||
+                  remoteNote.content != _selectedNote!.content ||
+                  remoteNote.isPinned != _selectedNote!.isPinned) {
+                _selectedNote = remoteNote;
+              }
+            } else {
+              _selectedNote = _notes.isNotEmpty ? _notes.first : null;
+            }
+          } else if (_notes.isNotEmpty) {
             _selectedNote = _notes.first;
-          });
-        }
+          }
+        });
+        VaultService.saveCachedNotes(widget.vaultId, _notes);
       }
     } catch (e) {
       debugPrint('Sync silently error: $e');
@@ -209,6 +263,8 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
       _notes = [];
       _notesNotifier.value = [];
       _pinnedNoteIds.clear();
+      _lastLocalEditAt.clear();
+      _isLoading = true;
       _loadPinnedNotes();
       _fetchNotes();
       _setupRealtime();
@@ -231,8 +287,28 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _fetchNotes() async {
+    // Show offline-cached notes immediately while fetching from cloud
+    final cached = await VaultService.getCachedNotes(widget.vaultId);
+    if (cached.isNotEmpty && mounted && _notes.isEmpty) {
+      setState(() {
+        _notes = cached;
+        _notesNotifier.value = List.of(_notes);
+        _isLoading = false;
+        _selectedNote ??= _notes.first;
+        for (final n in cached) {
+          if (n.isPinned) _pinnedNoteIds.add(n.id);
+        }
+      });
+    }
+
+    final client = _supabaseOrNull();
+    if (client == null) {
+      if (mounted) setState(() => _isLoading = false);
+      return;
+    }
+
     try {
-      final response = await Supabase.instance.client
+      final response = await client
           .from('notes')
           .select()
           .eq('vault_id', widget.vaultId)
@@ -244,12 +320,23 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           _notes = list;
+          for (final n in list) {
+            final parsed = parseNoteContent(n.content);
+            if (parsed.isPinned != null) {
+              if (parsed.isPinned!) {
+                _pinnedNoteIds.add(n.id);
+              } else {
+                _pinnedNoteIds.remove(n.id);
+              }
+            }
+          }
           _notesNotifier.value = List.of(_notes);
           _isLoading = false;
           if (_selectedNote == null && _notes.isNotEmpty) {
             _selectedNote = _notes.first;
           }
         });
+        VaultService.saveCachedNotes(widget.vaultId, _notes);
       }
     } catch (e) {
       debugPrint('Error fetching notes: $e');
@@ -265,22 +352,29 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
       id: newId,
       vaultId: widget.vaultId,
       title: '',
-      content: jsonEncode([
-        {'insert': '\n'}
-      ]),
+      content: jsonEncode({
+        'delta': [
+          {'insert': '\n'}
+        ],
+        'images': <dynamic>[],
+      }),
       plainText: '',
       updatedAt: DateTime.now(),
       isPinned: false,
     );
 
+    _lastLocalEditAt[newId] = DateTime.now();
     setState(() {
       _notes.insert(0, newNote);
       _notesNotifier.value = List.of(_notes);
       _selectedNote = newNote;
     });
+    VaultService.saveCachedNotes(widget.vaultId, _notes);
 
+    final client = _supabaseOrNull();
+    if (client == null) return;
     try {
-      await Supabase.instance.client.from('notes').insert(newNote.toMap());
+      await client.from('notes').insert(newNote.toMap());
       _broadcastSync();
     } catch (e) {
       debugPrint('Error creating note: $e');
@@ -300,10 +394,22 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
         _selectedNote = _notes.isNotEmpty ? _notes.first : null;
       }
     });
+    VaultService.saveCachedNotes(widget.vaultId, _notes);
 
+    final client = _supabaseOrNull();
+    if (client == null) return;
     try {
-      await Supabase.instance.client.from('notes').delete().eq('id', id);
+      await client.from('notes').delete().eq('id', id);
       _broadcastSync();
+      // Best-effort cleanup of images belonging to the deleted note
+      final parsed = parseNoteContent(removedNote.content);
+      final paths = parsed.images
+          .map((img) => extractNoteImageStoragePath(img.url))
+          .whereType<String>()
+          .toList();
+      if (paths.isNotEmpty) {
+        client.storage.from('note-images').remove(paths).catchError((_) => <FileObject>[]);
+      }
     } catch (e) {
       debugPrint('Error deleting note: $e');
       if (mounted) {
@@ -311,37 +417,70 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
           _notes.insert(noteIndex, removedNote);
           _notesNotifier.value = List.of(_notes);
         });
+        VaultService.saveCachedNotes(widget.vaultId, _notes);
       }
     }
   }
 
   Future<void> _togglePinNote(Note note) async {
     final newPinned = !_pinnedNoteIds.contains(note.id);
+    _lastLocalEditAt[note.id] = DateTime.now();
+
+    final parsed = parseNoteContent(note.content);
+    final updatedContent = jsonEncode({
+      'delta': parsed.document.toDelta().toJson(),
+      'images': parsed.images
+          .where((e) => !e.url.startsWith('data:image/'))
+          .map((e) => e.toJson())
+          .toList(),
+      'is_pinned': newPinned,
+    });
+
+    final updatedNote = note.copyWith(
+      isPinned: newPinned,
+      content: updatedContent,
+    );
+
     setState(() {
       if (newPinned) {
         _pinnedNoteIds.add(note.id);
       } else {
         _pinnedNoteIds.remove(note.id);
       }
+      final idx = _notes.indexWhere((n) => n.id == note.id);
+      if (idx != -1) {
+        _notes[idx] = updatedNote;
+        _notesNotifier.value = List.of(_notes);
+      }
+      if (_selectedNote?.id == note.id) {
+        _selectedNote = updatedNote;
+      }
     });
+    VaultService.saveCachedNotes(widget.vaultId, _notes);
 
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setStringList(
           'pinned_${widget.vaultId}', _pinnedNoteIds.toList());
 
-      _realtimeChannel?.sendBroadcastMessage(
-        event: 'pin_toggle',
-        payload: {
-          'vault': widget.vaultId,
-          'pinned': _pinnedNoteIds.toList(),
-        },
-      );
+      final client = _supabaseOrNull();
+      if (client != null) {
+        await client.from('notes').upsert(updatedNote.toMap());
+        _realtimeChannel?.sendBroadcastMessage(
+          event: 'pin_toggle',
+          payload: {
+            'vault': widget.vaultId,
+            'pinned': _pinnedNoteIds.toList(),
+          },
+        );
+        _broadcastSync();
+      }
     } catch (_) {}
   }
 
   void _handleNoteUpdated(
       String id, String title, String plainText, String content) {
+    _lastLocalEditAt[id] = DateTime.now();
     final index = _notes.indexWhere((n) => n.id == id);
     if (index != -1) {
       final current = _notes[index];
@@ -358,6 +497,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
       if (_selectedNote?.id == id) {
         _selectedNote = updated;
       }
+      VaultService.saveCachedNotes(widget.vaultId, _notes);
     }
   }
 
@@ -384,7 +524,6 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
   }
 
   void _showVaultDialog() {
-    final controller = TextEditingController(text: widget.vaultId);
     showGeneralDialog(
       context: context,
       barrierDismissible: true,
@@ -398,147 +537,19 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
         );
       },
       pageBuilder: (context, anim1, anim2) {
-        final theme = Theme.of(context);
-        final isDark = theme.brightness == Brightness.dark;
-
-        return Center(
-          child: Material(
-            color: Colors.transparent,
-            child: Container(
-              width: 380,
-              padding: const EdgeInsets.all(28),
-              decoration: BoxDecoration(
-                color: isDark ? const Color(0xFF16181D) : Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: isDark
-                      ? Colors.white.withAlpha(20)
-                      : Colors.black.withAlpha(15),
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withAlpha(isDark ? 80 : 30),
-                    blurRadius: 36,
-                    offset: const Offset(0, 16),
-                  ),
-                ],
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        'Синхронизация',
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w700,
-                          color: theme.colorScheme.onSurface,
-                        ),
-                      ),
-                      IconButton(
-                        icon: Icon(Icons.close_rounded,
-                            size: 20,
-                            color: theme.colorScheme.onSurfaceVariant),
-                        onPressed: () => Navigator.of(context).pop(),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 20),
-                  Container(
-                    padding: const EdgeInsets.all(14),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(16),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withAlpha(20),
-                          blurRadius: 16,
-                          offset: const Offset(0, 4),
-                        ),
-                      ],
-                    ),
-                    child: QrImageView(
-                      data: widget.vaultId,
-                      version: QrVersions.auto,
-                      size: 170,
-                      gapless: true,
-                    ),
-                  ),
-                  const SizedBox(height: 18),
-                  Text(
-                    'Отсканируйте камерой телефона или введите код на другом устройстве:',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 13,
-                      height: 1.4,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: isDark
-                          ? const Color(0xFF1E2026)
-                          : const Color(0xFFF1F3F5),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: TextField(
-                      controller: controller,
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 2,
-                      ),
-                      textCapitalization: TextCapitalization.characters,
-                      decoration: const InputDecoration(
-                        border: InputBorder.none,
-                        hintText: 'XXX-XXX',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 44,
-                    child: ElevatedButton(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF6366F1),
-                        foregroundColor: Colors.white,
-                        elevation: 0,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                      onPressed: () async {
-                        final newCode = controller.text.trim().toUpperCase();
-                        if (newCode.isNotEmpty && newCode != widget.vaultId) {
-                          await VaultService.setVaultId(newCode);
-                          if (context.mounted) {
-                            Navigator.of(context).pop();
-                            widget.onVaultChanged?.call(newCode);
-                          }
-                        } else {
-                          Navigator.of(context).pop();
-                        }
-                      },
-                      child: const Text(
-                        'Подключить хранилище',
-                        style: TextStyle(
-                            fontSize: 14, fontWeight: FontWeight.w600),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
+        return _VaultSyncDialog(
+          vaultId: widget.vaultId,
+          onVaultChanged: (newCode) => widget.onVaultChanged?.call(newCode),
         );
       },
+    );
+  }
+
+  void _focusSearch() {
+    _searchFocusNode.requestFocus();
+    _searchController.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _searchController.text.length,
     );
   }
 
@@ -570,10 +581,31 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
     final isDesktop = MediaQuery.sizeOf(context).width >= 720;
 
     if (isDesktop) {
-      return Scaffold(
-        backgroundColor:
-            isDark ? const Color(0xFF0D0E10) : const Color(0xFFF0F1F4),
-        body: Row(
+      return CallbackShortcuts(
+        bindings: <ShortcutActivator, VoidCallback>{
+          const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
+              _focusSearch,
+          const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+              _focusSearch,
+          const SingleActivator(LogicalKeyboardKey.keyN, meta: true):
+              _createNewNote,
+          const SingleActivator(LogicalKeyboardKey.keyN, control: true):
+              _createNewNote,
+          const SingleActivator(LogicalKeyboardKey.escape): () {
+            if (_searchFocusNode.hasFocus) {
+              if (_searchQuery.isNotEmpty) {
+                _searchController.clear();
+                setState(() => _searchQuery = '');
+              } else {
+                _searchFocusNode.unfocus();
+              }
+            }
+          },
+        },
+        child: Scaffold(
+          backgroundColor:
+              isDark ? const Color(0xFF0D0E10) : const Color(0xFFF0F1F4),
+          body: Row(
           children: [
             SizedBox(
               width: 270,
@@ -622,6 +654,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
               ),
             ),
           ],
+        ),
         ),
       );
     }
@@ -1079,11 +1112,8 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
                           note: note,
                           onTap: () {
                             Navigator.of(context).push(
-                              PageRouteBuilder(
-                                transitionDuration:
-                                    const Duration(milliseconds: 220),
-                                pageBuilder: (ctx, anim, _) =>
-                                    NoteMobileEditorScreen(
+                              CupertinoPageRoute(
+                                builder: (ctx) => NoteMobileEditorScreen(
                                   note: note,
                                   vaultId: widget.vaultId,
                                   notesNotifier: _notesNotifier,
@@ -1091,19 +1121,6 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
                                   onNoteDeleted: _deleteNote,
                                   onBroadcastSync: _broadcastSync,
                                 ),
-                                transitionsBuilder:
-                                    (ctx, anim, secondaryAnim, child) {
-                                  return SlideTransition(
-                                    position: Tween<Offset>(
-                                      begin: const Offset(1, 0),
-                                      end: Offset.zero,
-                                    ).animate(CurvedAnimation(
-                                      parent: anim,
-                                      curve: Curves.easeOutCubic,
-                                    )),
-                                    child: child,
-                                  );
-                                },
                               ),
                             );
                           },
@@ -1487,18 +1504,345 @@ class _NoteMobileEditorScreenState extends State<NoteMobileEditorScreen> {
   }
 }
 
-class AppImageCache {
-  static final Map<String, Uint8List> _cache = {};
+class _VaultSyncDialog extends StatefulWidget {
+  final String vaultId;
+  final ValueChanged<String> onVaultChanged;
 
-  static void put(String url, Uint8List bytes) {
-    if (_cache.length > 80) {
-      _cache.remove(_cache.keys.first);
-    }
-    _cache[url] = bytes;
+  const _VaultSyncDialog({
+    required this.vaultId,
+    required this.onVaultChanged,
+  });
+
+  @override
+  State<_VaultSyncDialog> createState() => _VaultSyncDialogState();
+}
+
+class _VaultSyncDialogState extends State<_VaultSyncDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.vaultId);
   }
 
-  static Uint8List? get(String url) => _cache[url];
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final newCode = _controller.text.trim().toUpperCase();
+    if (newCode.isNotEmpty && newCode != widget.vaultId) {
+      await VaultService.setVaultId(newCode);
+      if (mounted) {
+        Navigator.of(context).pop();
+        widget.onVaultChanged(newCode);
+      }
+    } else if (mounted) {
+      Navigator.of(context).pop();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    return Center(
+      child: Material(
+        color: Colors.transparent,
+        child: Container(
+          width: 380,
+          padding: const EdgeInsets.all(28),
+          decoration: BoxDecoration(
+            color: isDark ? const Color(0xFF16181D) : Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: isDark
+                  ? Colors.white.withAlpha(20)
+                  : Colors.black.withAlpha(15),
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withAlpha(isDark ? 80 : 30),
+                blurRadius: 36,
+                offset: const Offset(0, 16),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'Синхронизация',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                      color: theme.colorScheme.onSurface,
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.close_rounded,
+                        size: 20, color: theme.colorScheme.onSurfaceVariant),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withAlpha(20),
+                      blurRadius: 16,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: QrImageView(
+                  data: widget.vaultId,
+                  version: QrVersions.auto,
+                  size: 170,
+                  gapless: true,
+                ),
+              ),
+              const SizedBox(height: 18),
+              Text(
+                'Отсканируйте камерой телефона или введите код на другом устройстве:',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 13,
+                  height: 1.4,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+                decoration: BoxDecoration(
+                  color: isDark
+                      ? const Color(0xFF1E2026)
+                      : const Color(0xFFF1F3F5),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: TextField(
+                  controller: _controller,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 2,
+                  ),
+                  textCapitalization: TextCapitalization.characters,
+                  onSubmitted: (_) => _submit(),
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    hintText: 'XXX-XXX',
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: double.infinity,
+                height: 44,
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF6366F1),
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  onPressed: _submit,
+                  child: const Text(
+                    'Подключить хранилище',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Extracts the relative storage path inside the `note-images` bucket from a Supabase public URL.
+String? extractNoteImageStoragePath(String imageSource) {
+  final uri = Uri.tryParse(imageSource);
+  if (uri == null || !uri.hasScheme) return null;
+  final idx = uri.pathSegments.indexOf('note-images');
+  if (idx != -1 && idx + 1 < uri.pathSegments.length) {
+    return uri.pathSegments.sublist(idx + 1).join('/');
+  }
+  return null;
+}
+
+class ParsedNoteContent {
+  final Document document;
+  final List<CanvasImage> images;
+  final bool? isPinned;
+
+  ParsedNoteContent({
+    required this.document,
+    required this.images,
+    this.isPinned,
+  });
+}
+
+/// Parses either the structured `{delta, images, is_pinned}` format or legacy Delta list format.
+ParsedNoteContent parseNoteContent(String rawContent) {
+  if (rawContent.isEmpty) {
+    return ParsedNoteContent(document: Document(), images: []);
+  }
+  try {
+    final decoded = jsonDecode(rawContent);
+    if (decoded is Map && decoded['delta'] is List) {
+      final doc = Document.fromJson(decoded['delta']);
+      final images = decoded['images'] is List
+          ? (decoded['images'] as List)
+              .map((e) => CanvasImage.fromJson(Map<String, dynamic>.from(e)))
+              .toList()
+          : <CanvasImage>[];
+      final bool? pinned = decoded.containsKey('is_pinned')
+          ? decoded['is_pinned'] == true
+          : null;
+      return ParsedNoteContent(
+          document: doc, images: images, isPinned: pinned);
+    } else if (decoded is List) {
+      final textOps = <Map<String, dynamic>>[];
+      final extracted = <CanvasImage>[];
+      double initialY = 20.0;
+      for (final op in decoded) {
+        if (op is Map && op['insert'] is Map && op['insert']['image'] != null) {
+          extracted.add(CanvasImage(
+            id: 'img_legacy_${extracted.length}_${op['insert']['image'].toString().hashCode}',
+            url: op['insert']['image'].toString(),
+            x: 20.0,
+            y: initialY,
+            width: 320.0,
+          ));
+          initialY += 240.0;
+        } else if (op is Map) {
+          textOps.add(Map<String, dynamic>.from(op));
+        }
+      }
+      final doc = Document.fromJson(
+          textOps.isNotEmpty ? textOps : [{'insert': '\n'}]);
+      return ParsedNoteContent(document: doc, images: extracted);
+    }
+  } catch (_) {}
+  return ParsedNoteContent(document: Document(), images: []);
+}
+
+/// Computes new position and dimensions for a canvas image resized from an edge or corner,
+/// strictly locking aspect ratio and anchoring the opposite edge within `availableWidth`.
+({double x, double width, double height}) computeEdgeResize({
+  required double currentX,
+  required double currentWidth,
+  required double? currentHeight,
+  required double? aspectRatio,
+  required Offset delta,
+  required String edge,
+  required double availableWidth,
+}) {
+  final ar = (aspectRatio != null && aspectRatio > 0)
+      ? aspectRatio
+      : ((currentHeight != null && currentHeight > 0)
+          ? (currentWidth / currentHeight)
+          : 1.0);
+  final minW = min(80.0, max(1.0, availableWidth));
+
+  if (edge == 'left' || edge == 'bottom_left') {
+    final rightEdge = min(availableWidth, currentX + currentWidth);
+    final maxW = max(minW, rightEdge);
+    final deltaW = edge == 'left'
+        ? -delta.dx
+        : (((-delta.dx * ar + delta.dy) / (ar * ar + 1.0)) * ar);
+    final double newWidth = (currentWidth + deltaW).clamp(minW, maxW).toDouble();
+    final double newHeight = newWidth / ar;
+    final double newX = (rightEdge - newWidth)
+        .clamp(0.0, max(0.0, availableWidth - newWidth))
+        .toDouble();
+    return (x: newX, width: newWidth, height: newHeight);
+  }
+
+  final maxW = max(minW, availableWidth - currentX);
+  double deltaW;
+  if (edge == 'right') {
+    deltaW = delta.dx;
+  } else if (edge == 'bottom') {
+    deltaW = delta.dy * ar;
+  } else {
+    // bottom_right diagonal projection
+    deltaW = ((delta.dx * ar + delta.dy) / (ar * ar + 1.0)) * ar;
+  }
+  final double newWidth = (currentWidth + deltaW).clamp(minW, maxW).toDouble();
+  final double newHeight = newWidth / ar;
+  final double newX =
+      currentX.clamp(0.0, max(0.0, availableWidth - newWidth)).toDouble();
+  return (x: newX, width: newWidth, height: newHeight);
+}
+
+class AppImageCache {
+  static final Map<String, Uint8List> _cache = {};
+  static int _totalBytes = 0;
+  static const int _maxEntries = 60;
+  static const int _maxBytes = 40 * 1024 * 1024; // 40 MB cap
+
+  static void put(String url, Uint8List bytes) {
+    final existing = _cache.remove(url);
+    if (existing != null) {
+      _totalBytes -= existing.length;
+    }
+    _cache[url] = bytes;
+    _totalBytes += bytes.length;
+
+    while (_cache.length > _maxEntries ||
+        (_totalBytes > _maxBytes && _cache.length > 1)) {
+      final oldestKey = _cache.keys.first;
+      final removed = _cache.remove(oldestKey);
+      if (removed != null) {
+        _totalBytes -= removed.length;
+      }
+    }
+  }
+
+  static Uint8List? get(String url) {
+    final bytes = _cache.remove(url);
+    if (bytes != null) {
+      // Refresh LRU position
+      _cache[url] = bytes;
+    }
+    return bytes;
+  }
+
   static bool has(String url) => _cache.containsKey(url);
+
+  static void remove(String url) {
+    final removed = _cache.remove(url);
+    if (removed != null) {
+      _totalBytes -= removed.length;
+    }
+  }
+
+  static void clear() {
+    _cache.clear();
+    _totalBytes = 0;
+  }
+
+  static int get totalBytes => _totalBytes;
 }
 
 class CanvasImage {
@@ -1511,6 +1855,8 @@ class CanvasImage {
   double? naturalWidth;
   double? naturalHeight;
   double? aspectRatio;
+  bool uploadFailed;
+  Uint8List? pendingBytes;
 
   CanvasImage({
     required this.id,
@@ -1522,6 +1868,8 @@ class CanvasImage {
     this.naturalWidth,
     this.naturalHeight,
     this.aspectRatio,
+    this.uploadFailed = false,
+    this.pendingBytes,
   });
 
   Map<String, dynamic> toJson() => {
@@ -1564,11 +1912,11 @@ class ImageActions {
               : imageSource;
           bytes = base64Decode(base64String);
         } else {
-          final uri = Uri.tryParse(imageSource);
-          if (uri != null) {
+          final storagePath = extractNoteImageStoragePath(imageSource);
+          if (storagePath != null) {
             final res = await Supabase.instance.client.storage
                 .from('note-images')
-                .download(uri.pathSegments.sublist(1).join('/'));
+                .download(storagePath);
             bytes = res;
           }
         }
@@ -1652,6 +2000,7 @@ class _CanvasImageWidget extends StatefulWidget {
   final CanvasImage image;
   final double maxWidth;
   final bool isMobile;
+  final bool isSelected;
   final VoidCallback onSelect;
   final Function(Offset delta) onDragUpdate;
   final VoidCallback onDragEnd;
@@ -1662,12 +2011,14 @@ class _CanvasImageWidget extends StatefulWidget {
   final Function(String source) onCopy;
   final Function(String source, Widget imageWidget) onShowLightbox;
   final VoidCallback? onDimensionsResolved;
+  final VoidCallback? onRetryUpload;
 
   const _CanvasImageWidget({
     super.key,
     required this.image,
     required this.maxWidth,
     required this.isMobile,
+    this.isSelected = false,
     required this.onSelect,
     required this.onDragUpdate,
     required this.onDragEnd,
@@ -1678,6 +2029,7 @@ class _CanvasImageWidget extends StatefulWidget {
     required this.onCopy,
     required this.onShowLightbox,
     this.onDimensionsResolved,
+    this.onRetryUpload,
   });
 
   @override
@@ -1688,6 +2040,8 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
   bool _isHovered = false;
   bool _isDragging = false;
   bool _isResizing = false;
+  ImageStream? _imageStream;
+  ImageStreamListener? _imageStreamListener;
 
   @override
   void initState() {
@@ -1704,7 +2058,22 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
     }
   }
 
+  @override
+  void dispose() {
+    _detachImageListener();
+    super.dispose();
+  }
+
+  void _detachImageListener() {
+    if (_imageStream != null && _imageStreamListener != null) {
+      _imageStream!.removeListener(_imageStreamListener!);
+    }
+    _imageStream = null;
+    _imageStreamListener = null;
+  }
+
   void _resolveImageDimensions() {
+    _detachImageListener();
     final imageSource = widget.image.url;
     ImageProvider? provider;
     final cachedBytes = AppImageCache.get(imageSource);
@@ -1728,12 +2097,15 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
 
     final stream = provider.resolve(ImageConfiguration.empty);
     late ImageStreamListener listener;
-    listener = ImageStreamListener((ImageInfo info, bool _) {
+    void applyResolved(ImageInfo info) {
       final nw = info.image.width.toDouble();
       final nh = info.image.height.toDouble();
       if (nw > 0 && nh > 0 && mounted) {
         final ar = nw / nh;
+        final hadNoSavedMetadata = widget.image.aspectRatio == null &&
+            widget.image.naturalWidth == null;
         bool shouldUpdate = false;
+
         if (widget.image.aspectRatio == null ||
             widget.image.naturalWidth == null) {
           widget.image.naturalWidth = nw;
@@ -1742,8 +2114,10 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
           shouldUpdate = true;
         }
 
-        // If the container was created with default width (e.g. 340) but screenshot is narrow:
-        if (widget.image.width >= 320.0 && nw < widget.image.width) {
+        // Auto-fit narrow screenshots ONLY on first uninitialized resolution so manual resizes stay intact
+        if (hadNoSavedMetadata &&
+            (widget.image.width == 320.0 || widget.image.width == 340.0) &&
+            nw < widget.image.width) {
           widget.image.width = max(80.0, nw);
           widget.image.height = widget.image.width / ar;
           shouldUpdate = true;
@@ -1757,7 +2131,22 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
           widget.onDimensionsResolved?.call();
         }
       }
-    }, onError: (_, __) {});
+    }
+
+    listener = ImageStreamListener((ImageInfo info, bool synchronousCall) {
+      if (synchronousCall) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) applyResolved(info);
+        });
+      } else {
+        applyResolved(info);
+      }
+      _detachImageListener();
+    }, onError: (_, _) {
+      _detachImageListener();
+    });
+    _imageStream = stream;
+    _imageStreamListener = listener;
     stream.addListener(listener);
   }
 
@@ -1935,12 +2324,148 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
     }
   }
 
+  Widget _buildEdgeHandle({
+    required String edge,
+    required MouseCursor cursor,
+    required bool isDark,
+    required bool visible,
+    double? top,
+    double? bottom,
+    double? left,
+    double? right,
+    double? width,
+    double? height,
+  }) {
+    final isHorizontal = edge == 'bottom';
+    return Positioned(
+      top: top,
+      bottom: bottom,
+      left: left,
+      right: right,
+      width: width,
+      height: height,
+      child: MouseRegion(
+        cursor: cursor,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onPanStart: (_) {
+            widget.onSelect();
+            setState(() => _isResizing = true);
+          },
+          onPanUpdate: (details) => widget.onResizeEdge(details.delta, edge),
+          onPanEnd: (_) {
+            setState(() => _isResizing = false);
+            widget.onDragEnd();
+          },
+          onPanCancel: () {
+            setState(() => _isResizing = false);
+            widget.onDragEnd();
+          },
+          child: Center(
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 160),
+              opacity: visible ? 0.90 : 0.0,
+              child: Container(
+                width: isHorizontal ? 32 : 4,
+                height: isHorizontal ? 4 : 32,
+                decoration: BoxDecoration(
+                  color: isDark
+                      ? Colors.white.withOpacity(0.55)
+                      : Colors.black.withOpacity(0.45),
+                  borderRadius: BorderRadius.circular(2),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.3),
+                      blurRadius: 4,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCornerHandle({
+    required String edge,
+    required MouseCursor cursor,
+    required IconData icon,
+    required bool isDark,
+    required bool showHandle,
+    double idleOpacity = 0.0,
+    double? left,
+    double? right,
+  }) {
+    final isRight = right != null;
+    return Positioned(
+      bottom: 0,
+      left: left,
+      right: right,
+      width: 28,
+      height: 28,
+      child: MouseRegion(
+        cursor: cursor,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onPanStart: (_) {
+            widget.onSelect();
+            setState(() => _isResizing = true);
+          },
+          onPanUpdate: (details) => widget.onResizeEdge(details.delta, edge),
+          onPanEnd: (_) {
+            setState(() => _isResizing = false);
+            widget.onDragEnd();
+          },
+          onPanCancel: () {
+            setState(() => _isResizing = false);
+            widget.onDragEnd();
+          },
+          child: Container(
+            alignment: isRight ? Alignment.bottomRight : Alignment.bottomLeft,
+            padding: EdgeInsets.only(
+              left: isRight ? 0 : 3,
+              right: isRight ? 3 : 0,
+              bottom: 3,
+            ),
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 160),
+              opacity: showHandle ? 0.95 : idleOpacity,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: showHandle
+                      ? Colors.black.withOpacity(0.65)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.only(
+                    topLeft: Radius.circular(isRight ? 6 : 0),
+                    topRight: Radius.circular(isRight ? 0 : 6),
+                    bottomRight: Radius.circular(isRight ? 10 : 0),
+                    bottomLeft: Radius.circular(isRight ? 0 : 10),
+                  ),
+                ),
+                padding: const EdgeInsets.all(2),
+                child: Icon(
+                  icon,
+                  size: 14,
+                  color: isDark ? Colors.white70 : Colors.black54,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final imageWidget = _buildImageContent();
+    final bool showControls =
+        _isHovered || _isDragging || _isResizing || widget.isSelected;
 
-    final borderColor = (_isDragging || _isResizing)
+    final borderColor = (_isDragging || _isResizing || widget.isSelected)
         ? const Color(0xFF6366F1).withOpacity(0.85)
         : (_isHovered
             ? (isDark
@@ -1953,9 +2478,11 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
     final cardBg = isDark ? const Color(0xFF16181D) : Colors.white;
 
     final ar = widget.image.aspectRatio;
-    final displayHeight = (widget.image.height != null && widget.image.height! > 0)
+    final double displayHeight = (widget.image.height != null && widget.image.height! > 0)
         ? widget.image.height!
-        : ((ar != null && ar > 0) ? (widget.image.width / ar) : null);
+        : ((ar != null && ar > 0)
+            ? (widget.image.width / ar)
+            : (widget.image.width * 0.75));
 
     return MouseRegion(
       cursor:
@@ -1965,7 +2492,13 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTapDown: (_) => widget.onSelect(),
-        onTap: () => widget.onShowLightbox(widget.image.url, imageWidget),
+        onTap: () {
+          if (widget.isMobile && !widget.isSelected) {
+            widget.onSelect();
+          } else {
+            widget.onShowLightbox(widget.image.url, imageWidget);
+          }
+        },
         onSecondaryTapDown: (details) =>
             _showContextMenu(details, widget.image.url, imageWidget),
         onPanStart: (details) {
@@ -1984,7 +2517,9 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
           widget.onDragEnd();
         },
         child: AnimatedContainer(
-          duration: const Duration(milliseconds: 140),
+          duration: (_isDragging || _isResizing)
+              ? Duration.zero
+              : const Duration(milliseconds: 140),
           curve: Curves.easeOutCubic,
           width: widget.image.width,
           height: displayHeight,
@@ -1996,7 +2531,7 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
               BoxShadow(
                 color: Colors.black.withOpacity(_isDragging
                     ? 0.50
-                    : (_isHovered
+                    : (_isHovered || widget.isSelected
                         ? (isDark ? 0.35 : 0.10)
                         : (isDark ? 0.25 : 0.05))),
                 blurRadius: _isDragging ? 24 : (_isHovered ? 16 : 8),
@@ -2005,7 +2540,7 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
             ],
           ),
           child: Stack(
-            fit: displayHeight != null ? StackFit.expand : StackFit.loose,
+            fit: StackFit.expand,
             children: [
               // Image content edge-to-edge with no empty space
               ClipRRect(
@@ -2017,385 +2552,203 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
                 ),
               ),
 
-              // Floating Controls Bar on Hover / Drag
+              if (widget.image.uploadFailed)
+                Positioned(
+                  top: 6,
+                  left: 6,
+                  child: GestureDetector(
+                    onTap: widget.onRetryUpload,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.red.shade700.withOpacity(0.92),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.refresh_rounded,
+                              size: 13, color: Colors.white),
+                          SizedBox(width: 4),
+                          Text(
+                            'Повторить загрузку',
+                            style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+
+              // Floating Controls Bar on Hover / Drag / Select (never intercepts touches when hidden)
               Positioned(
                 top: 6,
                 right: 6,
-                child: AnimatedOpacity(
-                  duration: const Duration(milliseconds: 160),
-                  opacity: (_isHovered || _isDragging) ? 1.0 : 0.0,
-                  child: Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.80),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: Colors.white.withOpacity(0.18),
-                        width: 1,
+                child: IgnorePointer(
+                  ignoring: !showControls,
+                  child: AnimatedOpacity(
+                    duration: const Duration(milliseconds: 160),
+                    opacity: showControls ? 1.0 : 0.0,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.80),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.18),
+                          width: 1,
+                        ),
                       ),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(
-                          Icons.drag_indicator_rounded,
-                          size: 15,
-                          color: Colors.white70,
-                        ),
-                        const SizedBox(width: 6),
-                        // Scale Down (-)
-                        Tooltip(
-                          message: 'Уменьшить (-15%)',
-                          child: InkWell(
-                            onTap: () => widget.onScaleStep(1 / 1.15),
-                            borderRadius: BorderRadius.circular(4),
-                            child: const Padding(
-                              padding: EdgeInsets.all(2),
-                              child: Icon(
-                                Icons.remove_rounded,
-                                size: 14,
-                                color: Colors.white70,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(
+                            Icons.drag_indicator_rounded,
+                            size: 15,
+                            color: Colors.white70,
+                          ),
+                          const SizedBox(width: 6),
+                          Tooltip(
+                            message: 'Уменьшить (-15%)',
+                            child: InkWell(
+                              onTap: () => widget.onScaleStep(1 / 1.15),
+                              borderRadius: BorderRadius.circular(4),
+                              child: const Padding(
+                                padding: EdgeInsets.all(2),
+                                child: Icon(
+                                  Icons.remove_rounded,
+                                  size: 14,
+                                  color: Colors.white70,
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                        const SizedBox(width: 4),
-                        // Scale Up (+)
-                        Tooltip(
-                          message: 'Увеличить (+15%)',
-                          child: InkWell(
-                            onTap: () => widget.onScaleStep(1.15),
-                            borderRadius: BorderRadius.circular(4),
-                            child: const Padding(
-                              padding: EdgeInsets.all(2),
-                              child: Icon(
-                                Icons.add_rounded,
-                                size: 14,
-                                color: Colors.white70,
+                          const SizedBox(width: 4),
+                          Tooltip(
+                            message: 'Увеличить (+15%)',
+                            child: InkWell(
+                              onTap: () => widget.onScaleStep(1.15),
+                              borderRadius: BorderRadius.circular(4),
+                              child: const Padding(
+                                padding: EdgeInsets.all(2),
+                                child: Icon(
+                                  Icons.add_rounded,
+                                  size: 14,
+                                  color: Colors.white70,
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                        const SizedBox(width: 4),
-                        // Reset to 1:1 original size
-                        Tooltip(
-                          message: 'Оригинальный размер (100%)',
-                          child: InkWell(
-                            onTap: () => widget.onResetScale(),
-                            borderRadius: BorderRadius.circular(4),
-                            child: const Padding(
-                              padding: EdgeInsets.all(2),
-                              child: Icon(
-                                Icons.aspect_ratio_rounded,
-                                size: 13,
-                                color: Colors.white70,
+                          const SizedBox(width: 4),
+                          Tooltip(
+                            message: 'Оригинальный размер (100%)',
+                            child: InkWell(
+                              onTap: () => widget.onResetScale(),
+                              borderRadius: BorderRadius.circular(4),
+                              child: const Padding(
+                                padding: EdgeInsets.all(2),
+                                child: Icon(
+                                  Icons.aspect_ratio_rounded,
+                                  size: 13,
+                                  color: Colors.white70,
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                        const SizedBox(width: 5),
-                        Container(width: 1, height: 12, color: Colors.white24),
-                        const SizedBox(width: 5),
-                        Tooltip(
-                          message: 'На весь экран',
-                          child: InkWell(
-                            onTap: () => widget.onShowLightbox(
-                                widget.image.url, imageWidget),
-                            borderRadius: BorderRadius.circular(4),
-                            child: const Padding(
-                              padding: EdgeInsets.all(2),
-                              child: Icon(
-                                Icons.fullscreen_rounded,
-                                size: 15,
-                                color: Colors.white70,
+                          const SizedBox(width: 5),
+                          Container(width: 1, height: 12, color: Colors.white24),
+                          const SizedBox(width: 5),
+                          Tooltip(
+                            message: 'На весь экран',
+                            child: InkWell(
+                              onTap: () => widget.onShowLightbox(
+                                  widget.image.url, imageWidget),
+                              borderRadius: BorderRadius.circular(4),
+                              child: const Padding(
+                                padding: EdgeInsets.all(2),
+                                child: Icon(
+                                  Icons.fullscreen_rounded,
+                                  size: 15,
+                                  color: Colors.white70,
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                        const SizedBox(width: 4),
-                        Tooltip(
-                          message: 'Удалить',
-                          child: InkWell(
-                            onTap: () => widget.onDelete(),
-                            borderRadius: BorderRadius.circular(4),
-                            child: const Padding(
-                              padding: EdgeInsets.all(2),
-                              child: Icon(
-                                Icons.close_rounded,
-                                size: 15,
-                                color: Colors.white70,
+                          const SizedBox(width: 4),
+                          Tooltip(
+                            message: 'Удалить',
+                            child: InkWell(
+                              onTap: () => widget.onDelete(),
+                              borderRadius: BorderRadius.circular(4),
+                              child: const Padding(
+                                padding: EdgeInsets.all(2),
+                                child: Icon(
+                                  Icons.close_rounded,
+                                  size: 15,
+                                  color: Colors.white70,
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
               ),
 
-              // --- Edge & Corner Resize Handles ---
-
-              // 1. Right Edge Resize Handle
-              Positioned(
+              // Edge & Corner Resize Handles
+              _buildEdgeHandle(
+                edge: 'right',
+                cursor: SystemMouseCursors.resizeLeftRight,
+                isDark: isDark,
+                visible: _isHovered || _isResizing || widget.isSelected,
                 top: 20,
                 bottom: 28,
                 right: 0,
                 width: 14,
-                child: MouseRegion(
-                  cursor: SystemMouseCursors.resizeLeftRight,
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onPanStart: (_) {
-                      widget.onSelect();
-                      setState(() => _isResizing = true);
-                    },
-                    onPanUpdate: (details) {
-                      widget.onResizeEdge(details.delta, 'right');
-                    },
-                    onPanEnd: (_) {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    onPanCancel: () {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    child: Center(
-                      child: AnimatedOpacity(
-                        duration: const Duration(milliseconds: 160),
-                        opacity: (_isHovered || _isResizing) ? 0.90 : 0.0,
-                        child: Container(
-                          width: 4,
-                          height: 32,
-                          decoration: BoxDecoration(
-                            color: isDark
-                                ? Colors.white.withOpacity(0.55)
-                                : Colors.black.withOpacity(0.45),
-                            borderRadius: BorderRadius.circular(2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.3),
-                                blurRadius: 4,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
               ),
-
-              // 2. Bottom Edge Resize Handle
-              Positioned(
+              _buildEdgeHandle(
+                edge: 'bottom',
+                cursor: SystemMouseCursors.resizeUpDown,
+                isDark: isDark,
+                visible: _isHovered || _isResizing || widget.isSelected,
                 left: 28,
                 right: 28,
                 bottom: 0,
                 height: 14,
-                child: MouseRegion(
-                  cursor: SystemMouseCursors.resizeUpDown,
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onPanStart: (_) {
-                      widget.onSelect();
-                      setState(() => _isResizing = true);
-                    },
-                    onPanUpdate: (details) {
-                      widget.onResizeEdge(details.delta, 'bottom');
-                    },
-                    onPanEnd: (_) {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    onPanCancel: () {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    child: Center(
-                      child: AnimatedOpacity(
-                        duration: const Duration(milliseconds: 160),
-                        opacity: (_isHovered || _isResizing) ? 0.90 : 0.0,
-                        child: Container(
-                          width: 32,
-                          height: 4,
-                          decoration: BoxDecoration(
-                            color: isDark
-                                ? Colors.white.withOpacity(0.55)
-                                : Colors.black.withOpacity(0.45),
-                            borderRadius: BorderRadius.circular(2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.3),
-                                blurRadius: 4,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
               ),
-
-              // 3. Left Edge Resize Handle
-              Positioned(
+              _buildEdgeHandle(
+                edge: 'left',
+                cursor: SystemMouseCursors.resizeLeftRight,
+                isDark: isDark,
+                visible: _isHovered || _isResizing || widget.isSelected,
                 top: 20,
                 bottom: 28,
                 left: 0,
                 width: 14,
-                child: MouseRegion(
-                  cursor: SystemMouseCursors.resizeLeftRight,
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onPanStart: (_) {
-                      widget.onSelect();
-                      setState(() => _isResizing = true);
-                    },
-                    onPanUpdate: (details) {
-                      widget.onResizeEdge(details.delta, 'left');
-                    },
-                    onPanEnd: (_) {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    onPanCancel: () {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    child: Center(
-                      child: AnimatedOpacity(
-                        duration: const Duration(milliseconds: 160),
-                        opacity: (_isHovered || _isResizing) ? 0.90 : 0.0,
-                        child: Container(
-                          width: 4,
-                          height: 32,
-                          decoration: BoxDecoration(
-                            color: isDark
-                                ? Colors.white.withOpacity(0.55)
-                                : Colors.black.withOpacity(0.45),
-                            borderRadius: BorderRadius.circular(2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.3),
-                                blurRadius: 4,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
               ),
-
-              // 4. Bottom-Right Corner Resize Grip
-              Positioned(
-                bottom: 0,
+              _buildCornerHandle(
+                edge: 'bottom_right',
+                cursor: SystemMouseCursors.resizeDownRight,
+                icon: Icons.south_east_rounded,
+                isDark: isDark,
+                showHandle: _isHovered || _isResizing || widget.isSelected,
+                idleOpacity: 0.35,
                 right: 0,
-                width: 28,
-                height: 28,
-                child: MouseRegion(
-                  cursor: SystemMouseCursors.resizeDownRight,
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onPanStart: (_) {
-                      widget.onSelect();
-                      setState(() => _isResizing = true);
-                    },
-                    onPanUpdate: (details) {
-                      widget.onResizeEdge(details.delta, 'bottom_right');
-                    },
-                    onPanEnd: (_) {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    onPanCancel: () {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    child: Container(
-                      alignment: Alignment.bottomRight,
-                      padding: const EdgeInsets.only(right: 3, bottom: 3),
-                      child: AnimatedOpacity(
-                        duration: const Duration(milliseconds: 160),
-                        opacity: (_isHovered || _isResizing) ? 0.95 : 0.35,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: (_isHovered || _isResizing)
-                                ? Colors.black.withOpacity(0.65)
-                                : Colors.transparent,
-                            borderRadius: const BorderRadius.only(
-                              topLeft: Radius.circular(6),
-                              bottomRight: Radius.circular(10),
-                            ),
-                          ),
-                          padding: const EdgeInsets.all(2),
-                          child: Icon(
-                            Icons.south_east_rounded,
-                            size: 14,
-                            color: isDark ? Colors.white70 : Colors.black54,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
               ),
-
-              // 5. Bottom-Left Corner Resize Grip
-              Positioned(
-                bottom: 0,
+              _buildCornerHandle(
+                edge: 'bottom_left',
+                cursor: SystemMouseCursors.resizeDownLeft,
+                icon: Icons.south_west_rounded,
+                isDark: isDark,
+                showHandle: _isHovered || _isResizing || widget.isSelected,
                 left: 0,
-                width: 28,
-                height: 28,
-                child: MouseRegion(
-                  cursor: SystemMouseCursors.resizeDownLeft,
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onPanStart: (_) {
-                      widget.onSelect();
-                      setState(() => _isResizing = true);
-                    },
-                    onPanUpdate: (details) {
-                      widget.onResizeEdge(details.delta, 'bottom_left');
-                    },
-                    onPanEnd: (_) {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    onPanCancel: () {
-                      setState(() => _isResizing = false);
-                      widget.onDragEnd();
-                    },
-                    child: Container(
-                      alignment: Alignment.bottomLeft,
-                      padding: const EdgeInsets.only(left: 3, bottom: 3),
-                      child: AnimatedOpacity(
-                        duration: const Duration(milliseconds: 160),
-                        opacity: (_isHovered || _isResizing) ? 0.95 : 0.0,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: (_isHovered || _isResizing)
-                                ? Colors.black.withOpacity(0.65)
-                                : Colors.transparent,
-                            borderRadius: const BorderRadius.only(
-                              topRight: Radius.circular(6),
-                              bottomLeft: Radius.circular(10),
-                            ),
-                          ),
-                          padding: const EdgeInsets.all(2),
-                          child: Icon(
-                            Icons.south_west_rounded,
-                            size: 14,
-                            color: isDark ? Colors.white70 : Colors.black54,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
               ),
             ],
           ),
@@ -2451,11 +2804,6 @@ class _AppImageWidget extends StatefulWidget {
 }
 
 class _AppImageWidgetState extends State<_AppImageWidget> {
-  void _deleteImage() {
-    final imageSource = widget.embedContext.node.value.data.toString();
-    widget.onDeleteImage?.call(imageSource);
-  }
-
   Widget _buildImageContent() {
     final imageSource = widget.embedContext.node.value.data.toString();
     final cachedBytes = AppImageCache.get(imageSource);
@@ -2552,6 +2900,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
   final ScrollController _editorScrollController = ScrollController();
   final GlobalKey<EditorState> _editorKey = GlobalKey<EditorState>();
   List<CanvasImage> _canvasImages = [];
+  String? _selectedImageId;
   StreamSubscription? _docChangeSub;
   Timer? _debounceTimer;
 
@@ -2572,6 +2921,14 @@ class _NoteEditorViewState extends State<NoteEditorView>
   bool _showFloatingToolbar = false;
   // Slash menu notifier (prevents rebuilding the entire editor during typing)
   final ValueNotifier<bool> _showSlashMenuNotifier = ValueNotifier(false);
+
+  SupabaseClient? _supabaseOrNull() {
+    try {
+      return Supabase.instance.client;
+    } catch (_) {
+      return null;
+    }
+  }
 
   void _subscribeToDocChanges() {
     _docChangeSub?.cancel();
@@ -2604,6 +2961,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
     _lastSavedContent = widget.note.content;
 
     final controllerConfig = QuillControllerConfig(
+      // ignore: experimental_member_use
       clipboardConfig: QuillClipboardConfig(
         onImagePaste: (bytes) async {
           await _insertImageBytes(bytes);
@@ -2612,50 +2970,11 @@ class _NoteEditorViewState extends State<NoteEditorView>
       ),
     );
 
-    Document doc;
-    if (widget.note.content.isNotEmpty) {
-      try {
-        final decoded = jsonDecode(widget.note.content);
-        if (decoded is Map && decoded['delta'] is List) {
-          doc = Document.fromJson(decoded['delta']);
-          if (decoded['images'] is List) {
-            _canvasImages = (decoded['images'] as List)
-                .map((e) => CanvasImage.fromJson(Map<String, dynamic>.from(e)))
-                .toList();
-          }
-        } else if (decoded is List) {
-          final textOps = <Map<String, dynamic>>[];
-          double initialY = 20.0;
-          for (final op in decoded) {
-            if (op is Map &&
-                op['insert'] is Map &&
-                op['insert']['image'] != null) {
-              _canvasImages.add(CanvasImage(
-                id: 'img_${DateTime.now().microsecondsSinceEpoch}_${_canvasImages.length}',
-                url: op['insert']['image'].toString(),
-                x: 20.0,
-                y: initialY,
-                width: 320.0,
-              ));
-              initialY += 240.0;
-            } else {
-              textOps.add(Map<String, dynamic>.from(op));
-            }
-          }
-          doc = Document.fromJson(
-              textOps.isNotEmpty ? textOps : [{'insert': '\n'}]);
-        } else {
-          doc = Document();
-        }
-      } catch (_) {
-        doc = Document();
-      }
-    } else {
-      doc = Document();
-    }
+    final parsed = parseNoteContent(widget.note.content);
+    _canvasImages = parsed.images;
 
     _quillController = QuillController(
-      document: doc,
+      document: parsed.document,
       selection: const TextSelection.collapsed(offset: 0),
       config: controllerConfig,
     );
@@ -2694,50 +3013,75 @@ class _NoteEditorViewState extends State<NoteEditorView>
     }
   }
 
+  void _applyParsedRemoteContent(String remoteContent) {
+    final parsed = parseNoteContent(remoteContent);
+    _canvasImages = parsed.images;
+    final oldSelection = _quillController.selection;
+    _setQuillDocument(parsed.document);
+    final newLen = _quillController.document.length;
+    final safeOffset = oldSelection.baseOffset.clamp(0, max<int>(0, newLen - 1));
+    _quillController.updateSelection(
+      TextSelection.collapsed(offset: safeOffset),
+      ChangeSource.local,
+    );
+  }
+
   @override
   void didUpdateWidget(covariant NoteEditorView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.note.id != widget.note.id) {
-      _debounceTimer?.cancel();
-      _saveNote();
+      if (_debounceTimer?.isActive ?? false) {
+        _debounceTimer?.cancel();
+        final prevNoteId = oldWidget.note.id;
+        final prevPinned = oldWidget.note.isPinned;
+        final prevTitle = _titleController.text.trim();
+        final prevDelta = _quillController.document.toDelta().toJson();
+        final prevPlain = _quillController.document.toPlainText().trim();
+        final prevImages = _canvasImages
+            .where((e) => !e.url.startsWith('data:image/'))
+            .map((e) => e.toJson())
+            .toList();
+        final prevContent = jsonEncode({
+          'delta': prevDelta,
+          'images': prevImages,
+          if (prevPinned) 'is_pinned': true,
+        });
+        Future.microtask(() async {
+          widget.onNoteUpdated?.call(prevNoteId, prevTitle, prevPlain, prevContent);
+          try {
+            await _supabaseOrNull()?.from('notes').upsert({
+              'id': prevNoteId,
+              'vault_id': widget.vaultId,
+              'title': prevTitle,
+              'content': prevContent,
+              'plain_text': prevPlain,
+              'updated_at': DateTime.now().toIso8601String(),
+            });
+          } catch (_) {}
+        });
+      }
 
       _isApplyingRemoteChange = true;
+      _selectedImageId = null;
+      _pendingRemoteTitle = null;
+      _pendingRemoteContent = null;
       _titleController.text = widget.note.title;
       _lastSavedTitle = widget.note.title;
       _lastSavedContent = widget.note.content;
 
-      Document newDoc;
-      List<CanvasImage> loadedImages = [];
-      if (widget.note.content.isNotEmpty) {
-        try {
-          final decoded = jsonDecode(widget.note.content);
-          if (decoded is List) {
-            newDoc = Document.fromJson(decoded);
-          } else if (decoded is Map && decoded['delta'] is List) {
-            newDoc = Document.fromJson(decoded['delta']);
-            if (decoded['images'] is List) {
-              loadedImages = (decoded['images'] as List)
-                  .map((e) =>
-                      CanvasImage.fromJson(Map<String, dynamic>.from(e)))
-                  .toList();
-            }
-          } else {
-            newDoc = Document();
-          }
-        } catch (_) {
-          newDoc = Document();
-        }
-      } else {
-        newDoc = Document();
-      }
-      _canvasImages = loadedImages;
-      _setQuillDocument(newDoc);
+      final parsed = parseNoteContent(widget.note.content);
+      _canvasImages = parsed.images;
+      _setQuillDocument(parsed.document);
       _quillController.updateSelection(
         const TextSelection.collapsed(offset: 0),
         ChangeSource.local,
       );
       _isApplyingRemoteChange = false;
-      _isSavedNotifier.value = true;
+      if (!_isSavedNotifier.value) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _isSavedNotifier.value = true;
+        });
+      }
     } else {
       final remoteTitle = widget.note.title;
       final remoteContent = widget.note.content;
@@ -2747,8 +3091,11 @@ class _NoteEditorViewState extends State<NoteEditorView>
       final bool contentChanged = remoteContent != _lastSavedContent;
 
       if (titleChanged || contentChanged) {
-        final hasPendingLocalChanges =
-            _isSavingNotifier.value || (_debounceTimer?.isActive ?? false);
+        final recentLocalEdit =
+            DateTime.now().difference(_lastLocalEditTime).inMilliseconds < 1200;
+        final hasPendingLocalChanges = recentLocalEdit ||
+            _isSavingNotifier.value ||
+            (_debounceTimer?.isActive ?? false);
 
         if (_isInsertingImage || hasPendingLocalChanges) {
           // Defer update until local saving completes
@@ -2769,31 +3116,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
             _titleController.text = remoteTitle;
           }
           if (contentChanged && remoteContent.isNotEmpty) {
-            try {
-              final decoded = jsonDecode(remoteContent);
-              Document newDoc;
-              if (decoded is List) {
-                newDoc = Document.fromJson(decoded);
-              } else if (decoded is Map && decoded['delta'] is List) {
-                newDoc = Document.fromJson(decoded['delta']);
-                if (decoded['images'] is List) {
-                  _canvasImages = (decoded['images'] as List)
-                      .map((e) =>
-                          CanvasImage.fromJson(Map<String, dynamic>.from(e)))
-                      .toList();
-                }
-              } else {
-                newDoc = Document();
-              }
-              final oldSelection = _quillController.selection;
-              _setQuillDocument(newDoc);
-              final newLen = _quillController.document.length;
-              final safeOffset = oldSelection.baseOffset.clamp(0, newLen - 1);
-              _quillController.updateSelection(
-                TextSelection.collapsed(offset: safeOffset),
-                ChangeSource.local,
-              );
-            } catch (_) {}
+            _applyParsedRemoteContent(remoteContent);
           }
         } finally {
           _isApplyingRemoteChange = false;
@@ -2834,54 +3157,8 @@ class _NoteEditorViewState extends State<NoteEditorView>
       _lastSavedContent = remoteContent;
       _isApplyingRemoteChange = true;
       try {
-        final decoded = jsonDecode(remoteContent);
-        Document newDoc;
-        List<CanvasImage> newImages = _canvasImages;
-        if (decoded is Map && decoded['delta'] is List) {
-          newDoc = Document.fromJson(decoded['delta']);
-          if (decoded['images'] is List) {
-            newImages = (decoded['images'] as List)
-                .map((e) => CanvasImage.fromJson(Map<String, dynamic>.from(e)))
-                .toList();
-          }
-        } else if (decoded is List) {
-          final textOps = <Map<String, dynamic>>[];
-          final extracted = <CanvasImage>[];
-          double curY = 20.0;
-          for (final op in decoded) {
-            if (op is Map &&
-                op['insert'] is Map &&
-                op['insert']['image'] != null) {
-              extracted.add(CanvasImage(
-                id: 'img_${DateTime.now().microsecondsSinceEpoch}_${extracted.length}',
-                url: op['insert']['image'].toString(),
-                x: 20.0,
-                y: curY,
-                width: 320.0,
-              ));
-              curY += 240.0;
-            } else {
-              textOps.add(Map<String, dynamic>.from(op));
-            }
-          }
-          newDoc = Document.fromJson(
-              textOps.isNotEmpty ? textOps : [{'insert': '\n'}]);
-          if (extracted.isNotEmpty) {
-            newImages = extracted;
-          }
-        } else {
-          newDoc = Document();
-        }
-        _canvasImages = newImages;
-        final oldSelection = _quillController.selection;
-        _setQuillDocument(newDoc);
-        final newLen = _quillController.document.length;
-        final safeOffset = oldSelection.baseOffset.clamp(0, newLen - 1);
-        _quillController.updateSelection(
-          TextSelection.collapsed(offset: safeOffset),
-          ChangeSource.local,
-        );
-      } catch (_) {} finally {
+        _applyParsedRemoteContent(remoteContent);
+      } finally {
         _isApplyingRemoteChange = false;
       }
     }
@@ -2896,10 +3173,15 @@ class _NoteEditorViewState extends State<NoteEditorView>
   void _onContentChanged() {
     if (_isApplyingRemoteChange || _isInternalDocUpdate) return;
 
-    // Check if user typed '/'
+    // Trigger '/' slash menu only at the start of a line or after whitespace (never inside URLs)
     final text = _quillController.document.toPlainText();
     final sel = _quillController.selection.baseOffset;
-    if (sel > 0 && sel <= text.length && text[sel - 1] == '/') {
+    final isSlashTrigger = sel > 0 &&
+        sel <= text.length &&
+        text[sel - 1] == '/' &&
+        (sel == 1 || text[sel - 2] == '\n' || text[sel - 2] == ' ');
+
+    if (isSlashTrigger) {
       if (!_showSlashMenuNotifier.value) {
         _showSlashMenuNotifier.value = true;
       }
@@ -2918,15 +3200,17 @@ class _NoteEditorViewState extends State<NoteEditorView>
 
   Future<void> _saveNote({bool force = false}) async {
     final title = _titleController.text.trim();
+    // Filter out temporary data:image/ entries so text/title always save reliably
+    final syncedImages = _canvasImages
+        .where((e) => !e.url.startsWith('data:image/'))
+        .map((e) => e.toJson())
+        .toList();
+
     final content = jsonEncode({
       'delta': _quillController.document.toDelta().toJson(),
-      'images': _canvasImages.map((e) => e.toJson()).toList(),
+      'images': syncedImages,
+      if (widget.note.isPinned) 'is_pinned': true,
     });
-
-    // Never save temporary data:image
-    if (content.contains('data:image/')) {
-      return;
-    }
 
     if (!force && title == _lastSavedTitle && content == _lastSavedContent) {
       _isSavedNotifier.value = true;
@@ -2940,14 +3224,17 @@ class _NoteEditorViewState extends State<NoteEditorView>
       widget.onNoteUpdated
           ?.call(widget.note.id, title, plainText, content);
 
-      await Supabase.instance.client.from('notes').upsert({
-        'id': widget.note.id,
-        'vault_id': widget.vaultId,
-        'title': title,
-        'content': content,
-        'plain_text': plainText,
-        'updated_at': DateTime.now().toIso8601String(),
-      });
+      final client = _supabaseOrNull();
+      if (client != null) {
+        await client.from('notes').upsert({
+          'id': widget.note.id,
+          'vault_id': widget.vaultId,
+          'title': title,
+          'content': content,
+          'plain_text': plainText,
+          'updated_at': DateTime.now().toIso8601String(),
+        });
+      }
       _lastSavedTitle = title;
       _lastSavedContent = content;
       _isSavedNotifier.value = true;
@@ -3074,81 +3361,50 @@ class _NoteEditorViewState extends State<NoteEditorView>
     }
   }
 
-  void _moveImageInDocument(String imageSource, int targetOffset) {
-    int currentImageOffset = -1;
-    int cur = 0;
-    for (final op in _quillController.document.toDelta().toList()) {
-      if (op.data is Map && (op.data as Map)['image'] == imageSource) {
-        currentImageOffset = cur;
-        break;
-      }
-      cur += (op.length ?? 1);
-    }
-
-    if (currentImageOffset == -1) return;
-
-    // If dropped in the same position, do nothing
-    if (targetOffset >= currentImageOffset &&
-        targetOffset <= currentImageOffset + 2) {
-      return;
-    }
-
-    // 1. Delete old image line
-    int deleteLength = 1;
-    final docLen = _quillController.document.length;
-    if (currentImageOffset + 1 < docLen - 1) {
-      final nextChar =
-          _quillController.document.getPlainText(currentImageOffset + 1, 1);
-      if (nextChar == '\n') {
-        deleteLength = 2;
-      }
-    }
-
-    _quillController.replaceText(currentImageOffset, deleteLength, '', null);
-
-    // 2. Adjust target offset
-    int adjustedTarget = targetOffset;
-    if (targetOffset > currentImageOffset) {
-      adjustedTarget = targetOffset - deleteLength;
-    }
-    adjustedTarget =
-        adjustedTarget.clamp(0, _quillController.document.length - 1);
-
-    // 3. Insert image cleanly
-    final plainText = _quillController.document.toPlainText();
-    final needsLeadingNewline = adjustedTarget > 0 &&
-        adjustedTarget <= plainText.length &&
-        plainText[adjustedTarget - 1] != '\n';
-
-    final needsTrailingNewline = adjustedTarget >= plainText.length ||
-        plainText[adjustedTarget] != '\n';
-
-    int insertPos = adjustedTarget;
-    if (needsLeadingNewline) {
-      _quillController.replaceText(insertPos, 0, '\n', null);
-      insertPos += 1;
-    }
-
-    _quillController.replaceText(
-        insertPos, 0, BlockEmbed.image(imageSource), null);
-    insertPos += 1;
-
-    if (needsTrailingNewline) {
-      _quillController.replaceText(insertPos, 0, '\n', null);
-      insertPos += 1;
-    }
-
-    _quillController.updateSelection(
-      TextSelection.collapsed(offset: insertPos),
-      ChangeSource.local,
-    );
-
-    _debounceTimer?.cancel();
-    _lastLocalEditTime = DateTime.now();
-    _isSavedNotifier.value = false;
+  Future<void> _uploadAndAttachImage(
+      CanvasImage targetImg, Uint8List optimizedBytes) async {
+    if (!mounted) return;
+    setState(() {
+      targetImg.uploadFailed = false;
+      targetImg.pendingBytes = optimizedBytes;
+    });
     _isSavingNotifier.value = true;
-    _saveNote(force: true);
-    widget.onBroadcastSync?.call();
+
+    try {
+      final cloudUrl = await _uploadImageToStorage(optimizedBytes);
+      if (cloudUrl != null && mounted) {
+        AppImageCache.put(cloudUrl, optimizedBytes);
+        final idx = _canvasImages.indexWhere((img) => img.id == targetImg.id);
+        if (idx != -1) {
+          setState(() {
+            _canvasImages[idx].url = cloudUrl;
+            _canvasImages[idx].uploadFailed = false;
+            _canvasImages[idx].pendingBytes = null;
+          });
+          await _saveNote(force: true);
+        }
+      } else if (mounted) {
+        setState(() {
+          targetImg.uploadFailed = true;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+                'Не удалось загрузить фото в облако. Нажмите «Повторить» на картинке.'),
+            backgroundColor: Colors.red.shade700,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Image upload error: $e');
+      if (mounted) {
+        setState(() => targetImg.uploadFailed = true);
+      }
+    } finally {
+      if (mounted) _isSavingNotifier.value = false;
+    }
   }
 
   Future<void> _insertImageBytes(Uint8List bytes) async {
@@ -3192,18 +3448,20 @@ class _NoteEditorViewState extends State<NoteEditorView>
         try {
           final decoded = img.decodeImage(optimized);
           if (decoded != null && decoded.width > 0 && decoded.height > 0) {
-            naturalWidth = decoded.width.toDouble();
-            naturalHeight = decoded.height.toDouble();
-            ar = naturalWidth! / naturalHeight!;
+            final nw = decoded.width.toDouble();
+            final nh = decoded.height.toDouble();
+            naturalWidth = nw;
+            naturalHeight = nh;
+            ar = nw / nh;
           }
         } catch (_) {}
       }
 
       double initWidth;
-      if (naturalWidth != null && naturalWidth! > 0) {
-        if (naturalWidth! < 340.0) {
-          // Narrow screenshot (e.g. 150px wide) - fit exact natural width with zero extra space!
-          initWidth = max(80.0, naturalWidth!);
+      if (naturalWidth != null && naturalWidth > 0) {
+        if (naturalWidth < 340.0) {
+          // Narrow screenshot (e.g. 150px wide) - fit exact natural width with zero extra space
+          initWidth = max(80.0, naturalWidth);
         } else {
           initWidth = 360.0;
         }
@@ -3228,32 +3486,19 @@ class _NoteEditorViewState extends State<NoteEditorView>
         naturalWidth: naturalWidth,
         naturalHeight: naturalHeight,
         aspectRatio: ar,
+        pendingBytes: optimized,
       );
 
       setState(() {
         _canvasImages.add(newImage);
+        _selectedImageId = imgId;
       });
 
       _debounceTimer?.cancel();
       _lastLocalEditTime = DateTime.now();
       _isSavedNotifier.value = false;
-      _isSavingNotifier.value = true;
 
-      try {
-        final cloudUrl = await _uploadImageToStorage(optimized);
-        if (cloudUrl != null && mounted) {
-          AppImageCache.put(cloudUrl, optimized);
-          final idx = _canvasImages.indexWhere((img) => img.id == imgId);
-          if (idx != -1) {
-            _canvasImages[idx].url = cloudUrl;
-            await _saveNote(force: true);
-          }
-        }
-      } catch (e) {
-        debugPrint('Image upload error: $e');
-      } finally {
-        if (mounted) _isSavingNotifier.value = false;
-      }
+      await _uploadAndAttachImage(newImage, optimized);
     } finally {
       _isInsertingImage = false;
     }
@@ -3554,56 +3799,73 @@ class _NoteEditorViewState extends State<NoteEditorView>
             ),
           );
 
-    return Stack(
-      children: [
-        GestureDetector(
-          onTap: () {
-            if (!_editorFocusNode.hasFocus) {
-              _editorFocusNode.requestFocus();
-            }
-          },
-          behavior: HitTestBehavior.translucent,
-          child: SingleChildScrollView(
-            controller: _editorScrollController,
-            physics: const AlwaysScrollableScrollPhysics(
-                parent: BouncingScrollPhysics()),
-            padding: EdgeInsets.symmetric(
-              horizontal: widget.isMobile ? 0 : 28,
-              vertical: widget.isMobile ? 8 : 24,
+    return CallbackShortcuts(
+      bindings: <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.escape): () {
+          if (_showSlashMenuNotifier.value) {
+            _showSlashMenuNotifier.value = false;
+          } else if (_selectedImageId != null) {
+            setState(() => _selectedImageId = null);
+          }
+        },
+      },
+      child: Stack(
+        children: [
+          GestureDetector(
+            onTap: () {
+              if (_selectedImageId != null) {
+                setState(() => _selectedImageId = null);
+              }
+              if (_showSlashMenuNotifier.value) {
+                _showSlashMenuNotifier.value = false;
+              }
+              if (!_editorFocusNode.hasFocus) {
+                _editorFocusNode.requestFocus();
+              }
+            },
+            behavior: HitTestBehavior.translucent,
+            child: SingleChildScrollView(
+              controller: _editorScrollController,
+              physics: const AlwaysScrollableScrollPhysics(
+                  parent: BouncingScrollPhysics()),
+              padding: EdgeInsets.symmetric(
+                horizontal: widget.isMobile ? 0 : 28,
+                vertical: widget.isMobile ? 8 : 24,
+              ),
+              child: editorLayout,
             ),
-            child: editorLayout,
           ),
-        ),
-        if (_showFloatingToolbar && !widget.isMobile)
-          Positioned(
-            top: 24,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: _buildFloatingSelectionCapsule(),
+          if (_showFloatingToolbar && !widget.isMobile)
+            Positioned(
+              top: 24,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: _buildFloatingSelectionCapsule(),
+              ),
             ),
+          ValueListenableBuilder<bool>(
+            valueListenable: _showSlashMenuNotifier,
+            builder: (context, showSlash, _) {
+              if (!showSlash) return const SizedBox.shrink();
+              return Positioned(
+                top: 80,
+                left: MediaQuery.sizeOf(context).width > 720
+                    ? (MediaQuery.sizeOf(context).width - 270) / 2 - 130
+                    : 30,
+                child: _buildSlashCommandMenu(),
+              );
+            },
           ),
-        ValueListenableBuilder<bool>(
-          valueListenable: _showSlashMenuNotifier,
-          builder: (context, showSlash, _) {
-            if (!showSlash) return const SizedBox.shrink();
-            return Positioned(
-              top: 80,
-              left: MediaQuery.sizeOf(context).width > 720
-                  ? (MediaQuery.sizeOf(context).width - 270) / 2 - 130
-                  : 30,
-              child: _buildSlashCommandMenu(),
-            );
-          },
-        ),
-        if (widget.isMobile)
-          Positioned(
-            bottom: MediaQuery.viewInsetsOf(context).bottom + 8,
-            left: 16,
-            right: 16,
-            child: _buildMobileToolbarStrip(),
-          ),
-      ],
+          if (widget.isMobile)
+            Positioned(
+              bottom: MediaQuery.viewInsetsOf(context).bottom + 8,
+              left: 16,
+              right: 16,
+              child: _buildMobileToolbarStrip(),
+            ),
+        ],
+      ),
     );
   }
 
@@ -3620,15 +3882,18 @@ class _NoteEditorViewState extends State<NoteEditorView>
         image: img,
         maxWidth: availableWidth,
         isMobile: widget.isMobile,
+        isSelected: _selectedImageId == img.id,
         onSelect: () {
           setState(() {
+            _selectedImageId = img.id;
             _canvasImages.remove(img);
             _canvasImages.add(img);
           });
         },
         onDragUpdate: (delta) {
           setState(() {
-            img.x = (img.x + delta.dx).clamp(0.0, maxX);
+            final currentMaxX = max(0.0, availableWidth - img.width);
+            img.x = (img.x + delta.dx).clamp(0.0, currentMaxX);
             img.y = max(0.0, img.y + delta.dy);
           });
           _handleAutoScrollOnCanvasDrag(img.y);
@@ -3642,51 +3907,18 @@ class _NoteEditorViewState extends State<NoteEditorView>
         },
         onResizeEdge: (delta, edge) {
           setState(() {
-            final ar = img.aspectRatio ??
-                ((img.height != null && img.height! > 0)
-                    ? (img.width / img.height!)
-                    : 1.0);
-            final minW = max(80.0, min(140.0, availableWidth * 0.2));
-            final maxW = availableWidth;
-
-            if (edge == 'right') {
-              final newWidth = (img.width + delta.dx).clamp(minW, maxW);
-              img.width = newWidth;
-              img.height = newWidth / ar;
-              img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
-            } else if (edge == 'bottom') {
-              final deltaW = delta.dy * ar;
-              final newWidth = (img.width + deltaW).clamp(minW, maxW);
-              img.width = newWidth;
-              img.height = newWidth / ar;
-              img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
-            } else if (edge == 'bottom_right') {
-              final diagonalProj =
-                  (delta.dx * ar + delta.dy) / (ar * ar + 1.0);
-              final deltaW = diagonalProj * ar;
-              final newWidth = (img.width + deltaW).clamp(minW, maxW);
-              img.width = newWidth;
-              img.height = newWidth / ar;
-              img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
-            } else if (edge == 'left') {
-              final deltaW = -delta.dx;
-              final newWidth = (img.width + deltaW).clamp(minW, maxW);
-              final actualDeltaW = newWidth - img.width;
-              img.width = newWidth;
-              img.height = newWidth / ar;
-              img.x = (img.x - actualDeltaW)
-                  .clamp(0.0, max(0.0, availableWidth - img.width));
-            } else if (edge == 'bottom_left') {
-              final diagonalProj =
-                  (-delta.dx * ar + delta.dy) / (ar * ar + 1.0);
-              final deltaW = diagonalProj * ar;
-              final newWidth = (img.width + deltaW).clamp(minW, maxW);
-              final actualDeltaW = newWidth - img.width;
-              img.width = newWidth;
-              img.height = newWidth / ar;
-              img.x = (img.x - actualDeltaW)
-                  .clamp(0.0, max(0.0, availableWidth - img.width));
-            }
+            final res = computeEdgeResize(
+              currentX: img.x,
+              currentWidth: img.width,
+              currentHeight: img.height,
+              aspectRatio: img.aspectRatio,
+              delta: delta,
+              edge: edge,
+              availableWidth: availableWidth,
+            );
+            img.x = res.x;
+            img.width = res.width;
+            img.height = res.height;
           });
         },
         onScaleStep: (factor) {
@@ -3695,8 +3927,8 @@ class _NoteEditorViewState extends State<NoteEditorView>
                 ((img.height != null && img.height! > 0)
                     ? (img.width / img.height!)
                     : 1.0);
-            final minW = max(80.0, min(140.0, availableWidth * 0.2));
-            final maxW = availableWidth;
+            final minW = min(80.0, max(1.0, availableWidth));
+            final maxW = max(minW, availableWidth);
 
             final newWidth = (img.width * factor).clamp(minW, maxW);
             img.width = newWidth;
@@ -3713,9 +3945,11 @@ class _NoteEditorViewState extends State<NoteEditorView>
                 ((img.height != null && img.height! > 0)
                     ? (img.width / img.height!)
                     : 1.0);
+            final minW = min(80.0, max(1.0, availableWidth));
+            final maxW = max(minW, availableWidth);
             final targetW = (img.naturalWidth != null && img.naturalWidth! > 0)
-                ? img.naturalWidth!.clamp(80.0, availableWidth)
-                : 320.0;
+                ? img.naturalWidth!.clamp(minW, maxW)
+                : min(320.0, maxW);
             img.width = targetW;
             img.height = targetW / ar;
             img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
@@ -3725,9 +3959,20 @@ class _NoteEditorViewState extends State<NoteEditorView>
           widget.onBroadcastSync?.call();
         },
         onDelete: () {
+          final removedUrl = img.url;
           setState(() {
+            if (_selectedImageId == img.id) _selectedImageId = null;
             _canvasImages.remove(img);
           });
+          AppImageCache.remove(removedUrl);
+          final storagePath = extractNoteImageStoragePath(removedUrl);
+          if (storagePath != null) {
+            _supabaseOrNull()
+                ?.storage
+                .from('note-images')
+                .remove([storagePath])
+                .catchError((_) => <FileObject>[]);
+          }
           _lastLocalEditTime = DateTime.now();
           _saveNote(force: true);
           widget.onBroadcastSync?.call();
@@ -3741,6 +3986,12 @@ class _NoteEditorViewState extends State<NoteEditorView>
         onDimensionsResolved: () {
           _saveNote(force: true);
           widget.onBroadcastSync?.call();
+        },
+        onRetryUpload: () {
+          final bytes = img.pendingBytes ?? AppImageCache.get(img.url);
+          if (bytes != null) {
+            _uploadAndAttachImage(img, bytes);
+          }
         },
       ),
     );
@@ -3951,7 +4202,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
     return Material(
       color: Colors.transparent,
       child: Container(
-        width: 240,
+        width: 260,
         decoration: BoxDecoration(
           color: isDark ? const Color(0xFF1A1C22) : Colors.white,
           borderRadius: BorderRadius.circular(14),
@@ -4021,12 +4272,16 @@ class _NoteEditorViewState extends State<NoteEditorView>
           children: [
             Icon(icon, size: 16, color: const Color(0xFF6366F1)),
             const SizedBox(width: 10),
-            Text(
-              title,
-              style: TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w500,
-                color: Theme.of(context).colorScheme.onSurface,
+            Expanded(
+              child: Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  color: Theme.of(context).colorScheme.onSurface,
+                ),
               ),
             ),
           ],

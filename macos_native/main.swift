@@ -5,20 +5,60 @@ import Network
 final class StaticFileServer {
     private let listener: NWListener
     private let rootDir: URL
-    let port: UInt16
+    private(set) var port: UInt16
 
     init(rootDir: URL) throws {
-        self.rootDir = rootDir
-        let chosenPort: UInt16 = 52831
+        self.rootDir = rootDir.standardizedFileURL
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        self.listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: chosenPort)!)
-        self.port = chosenPort
 
-        listener.newConnectionHandler = { [weak self] connection in
+        var boundListener: NWListener?
+        var boundPort: UInt16 = 52831
+        var lastError: Error?
+
+        for candidate in [UInt16(52831), 52832, 52833, 52834, 52835] {
+            do {
+                let candidateListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: candidate)!)
+                boundListener = candidateListener
+                boundPort = candidate
+                break
+            } catch {
+                lastError = error
+            }
+        }
+
+        if boundListener == nil {
+            if let fallback = try? NWListener(using: params, on: .any) {
+                boundListener = fallback
+                boundPort = 0
+            } else {
+                throw lastError ?? NSError(domain: "StaticFileServer", code: 1, userInfo: nil)
+            }
+        }
+
+        let chosenListener = boundListener!
+        self.listener = chosenListener
+        self.port = boundPort
+
+        let readySem = DispatchSemaphore(value: 0)
+        chosenListener.stateUpdateHandler = { state in
+            if case .ready = state {
+                readySem.signal()
+            } else if case .failed(_) = state {
+                readySem.signal()
+            } else if case .cancelled = state {
+                readySem.signal()
+            }
+        }
+
+        chosenListener.newConnectionHandler = { [weak self] connection in
             self?.handleConnection(connection)
         }
-        listener.start(queue: .global(qos: .userInteractive))
+        chosenListener.start(queue: .global(qos: .userInteractive))
+        _ = readySem.wait(timeout: .now() + 2.0)
+        if let actualPort = chosenListener.port?.rawValue, actualPort != 0 {
+            self.port = actualPort
+        }
     }
 
     private func handleConnection(_ connection: NWConnection) {
@@ -53,8 +93,11 @@ final class StaticFileServer {
                 path = String(path[..<queryIndex])
             }
 
-            let filePath = self.rootDir.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path)
-            if FileManager.default.fileExists(atPath: filePath.path),
+            let relPath = (path.hasPrefix("/") ? String(path.dropFirst()) : path)
+                .removingPercentEncoding ?? path
+            let filePath = self.rootDir.appendingPathComponent(relPath).standardizedFileURL
+            if filePath.path.hasPrefix(self.rootDir.path),
+               FileManager.default.fileExists(atPath: filePath.path),
                let fileData = try? Data(contentsOf: filePath) {
                 let mime = self.mimeType(for: filePath.pathExtension)
                 var headers = "HTTP/1.1 200 OK\r\n"
@@ -208,8 +251,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
             if let tiff = image.tiffRepresentation,
                let bitmap = NSBitmapImageRep(data: tiff) {
                 var rep = bitmap
-                let maxWidth: CGFloat = 1600
-                let maxHeight: CGFloat = 1600
+                let maxWidth: CGFloat = 2560
+                let maxHeight: CGFloat = 2560
                 let width = CGFloat(bitmap.pixelsWide)
                 let height = CGFloat(bitmap.pixelsHigh)
 
@@ -235,16 +278,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
                     }
                 }
 
-                // Быстрое сжатие до компактного JPEG 0.85 (размер в 20-50 раз меньше сырого PNG!)
-                if let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) {
-                    let base64 = jpegData.base64EncodedString()
-                    let dataUrl = "data:image/jpeg;base64,\(base64)"
+                // Сохраняем PNG без потерь для скриншотов до 3 МБ; для больших фото используем JPEG 0.92
+                if let pngData = rep.representation(using: .png, properties: [:]),
+                   pngData.count <= 3 * 1024 * 1024 {
+                    let base64 = pngData.base64EncodedString()
+                    let dataUrl = "data:image/png;base64,\(base64)"
                     let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
                     webView.evaluateJavaScript(js, completionHandler: nil)
                     return
-                } else if let pngData = rep.representation(using: .png, properties: [:]) {
-                    let base64 = pngData.base64EncodedString()
-                    let dataUrl = "data:image/png;base64,\(base64)"
+                } else if let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92]) {
+                    let base64 = jpegData.base64EncodedString()
+                    let dataUrl = "data:image/jpeg;base64,\(base64)"
                     let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
                     webView.evaluateJavaScript(js, completionHandler: nil)
                     return

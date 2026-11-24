@@ -18,7 +18,7 @@ String _generateUuid() {
 void main() {
   test('E2E Phone to Mac Image and Text Sync Test', () async {
     final client = SupabaseClient(supabaseUrl, supabaseAnonKey);
-    final vaultId = 'V3X-EGF';
+    final vaultId = 'TEST-E2E-CI';
     final noteId = _generateUuid();
 
     // 1. Phone creates a new note

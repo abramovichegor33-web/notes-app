@@ -25,8 +25,14 @@ func main() {
 		return
 	}
 
-	// 2. Запускаем локальный веб-сервер на свободном порту 127.0.0.1
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	// 2. Запускаем локальный веб-сервер: сначала пробуем фиксированный порт 52831 (чтобы сохранялся localStorage / vault_id), иначе свободный порт
+	var listener net.Listener
+	for _, p := range []int{52831, 52832, 52833, 52834, 52835, 0} {
+		listener, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error listening on 127.0.0.1: %v\n", err)
 		return

@@ -75,25 +75,36 @@ class Note {
     };
   }
 
+  Map<String, dynamic> toCacheMap() {
+    return {
+      ...toMap(),
+      'is_pinned': isPinned,
+    };
+  }
+
   String get formattedDate {
     final now = DateTime.now();
-    final difference = now.difference(updatedAt);
-    if (difference.inDays == 0 && now.day == updatedAt.day) {
-      final hour = updatedAt.hour.toString().padLeft(2, '0');
-      final minute = updatedAt.minute.toString().padLeft(2, '0');
+    final local = updatedAt.toLocal();
+    final today = DateTime(now.year, now.month, now.day);
+    final noteDay = DateTime(local.year, local.month, local.day);
+    final dayDiff = today.difference(noteDay).inDays;
+
+    if (dayDiff == 0) {
+      final hour = local.hour.toString().padLeft(2, '0');
+      final minute = local.minute.toString().padLeft(2, '0');
       return '$hour:$minute';
-    } else if (difference.inDays <= 1 && now.day - updatedAt.day == 1) {
+    } else if (dayDiff == 1) {
       return 'Вчера';
-    } else if (now.year == updatedAt.year) {
+    } else if (now.year == local.year) {
       const months = [
         'янв.', 'февр.', 'марта', 'апр.', 'мая', 'июня',
         'июля', 'авг.', 'сент.', 'окт.', 'нояб.', 'дек.'
       ];
-      return '${updatedAt.day} ${months[updatedAt.month - 1]}';
+      return '${local.day} ${months[local.month - 1]}';
     } else {
-      final day = updatedAt.day.toString().padLeft(2, '0');
-      final month = updatedAt.month.toString().padLeft(2, '0');
-      return '$day.$month.${updatedAt.year}';
+      final day = local.day.toString().padLeft(2, '0');
+      final month = local.month.toString().padLeft(2, '0');
+      return '$day.$month.${local.year}';
     }
   }
 }
