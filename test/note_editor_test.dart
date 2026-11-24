@@ -89,6 +89,8 @@ void main() {
 
     await tester.pumpAndSettle();
     expect(find.text('Image Note'), findsOneWidget);
+    expect(find.byType(Draggable<ImageDragPayload>), findsOneWidget);
+    expect(find.byType(DragTarget<ImageDragPayload>), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
