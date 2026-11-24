@@ -1508,6 +1508,9 @@ class CanvasImage {
   double y;
   double width;
   double? height;
+  double? naturalWidth;
+  double? naturalHeight;
+  double? aspectRatio;
 
   CanvasImage({
     required this.id,
@@ -1516,6 +1519,9 @@ class CanvasImage {
     required this.y,
     this.width = 320.0,
     this.height,
+    this.naturalWidth,
+    this.naturalHeight,
+    this.aspectRatio,
   });
 
   Map<String, dynamic> toJson() => {
@@ -1525,6 +1531,9 @@ class CanvasImage {
         'y': y,
         'width': width,
         if (height != null) 'height': height,
+        if (naturalWidth != null) 'naturalWidth': naturalWidth,
+        if (naturalHeight != null) 'naturalHeight': naturalHeight,
+        if (aspectRatio != null) 'aspectRatio': aspectRatio,
       };
 
   factory CanvasImage.fromJson(Map<String, dynamic> json) {
@@ -1535,6 +1544,9 @@ class CanvasImage {
       y: (json['y'] as num?)?.toDouble() ?? 20.0,
       width: (json['width'] as num?)?.toDouble() ?? 320.0,
       height: (json['height'] as num?)?.toDouble(),
+      naturalWidth: (json['naturalWidth'] as num?)?.toDouble(),
+      naturalHeight: (json['naturalHeight'] as num?)?.toDouble(),
+      aspectRatio: (json['aspectRatio'] as num?)?.toDouble(),
     );
   }
 }
@@ -1643,10 +1655,13 @@ class _CanvasImageWidget extends StatefulWidget {
   final VoidCallback onSelect;
   final Function(Offset delta) onDragUpdate;
   final VoidCallback onDragEnd;
-  final Function(double deltaWidth) onResize;
+  final Function(Offset delta) onResize;
+  final Function(double factor) onScaleStep;
+  final VoidCallback onResetScale;
   final VoidCallback onDelete;
   final Function(String source) onCopy;
   final Function(String source, Widget imageWidget) onShowLightbox;
+  final VoidCallback? onDimensionsResolved;
 
   const _CanvasImageWidget({
     super.key,
@@ -1657,9 +1672,12 @@ class _CanvasImageWidget extends StatefulWidget {
     required this.onDragUpdate,
     required this.onDragEnd,
     required this.onResize,
+    required this.onScaleStep,
+    required this.onResetScale,
     required this.onDelete,
     required this.onCopy,
     required this.onShowLightbox,
+    this.onDimensionsResolved,
   });
 
   @override
@@ -1669,6 +1687,78 @@ class _CanvasImageWidget extends StatefulWidget {
 class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
   bool _isHovered = false;
   bool _isDragging = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _resolveImageDimensions();
+  }
+
+  @override
+  void didUpdateWidget(covariant _CanvasImageWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.image.url != widget.image.url ||
+        oldWidget.image.aspectRatio != widget.image.aspectRatio) {
+      _resolveImageDimensions();
+    }
+  }
+
+  void _resolveImageDimensions() {
+    final imageSource = widget.image.url;
+    ImageProvider? provider;
+    final cachedBytes = AppImageCache.get(imageSource);
+    if (cachedBytes != null) {
+      provider = MemoryImage(cachedBytes);
+    } else if (imageSource.startsWith('data:image/') ||
+        imageSource.contains('base64')) {
+      final base64String =
+          imageSource.contains(',') ? imageSource.split(',')[1] : imageSource;
+      try {
+        provider = MemoryImage(base64Decode(base64String));
+      } catch (_) {}
+    } else {
+      final uri = Uri.tryParse(imageSource);
+      if (uri != null && uri.hasScheme) {
+        provider = NetworkImage(imageSource);
+      }
+    }
+
+    if (provider == null) return;
+
+    final stream = provider.resolve(ImageConfiguration.empty);
+    late ImageStreamListener listener;
+    listener = ImageStreamListener((ImageInfo info, bool _) {
+      final nw = info.image.width.toDouble();
+      final nh = info.image.height.toDouble();
+      if (nw > 0 && nh > 0 && mounted) {
+        final ar = nw / nh;
+        bool shouldUpdate = false;
+        if (widget.image.aspectRatio == null ||
+            widget.image.naturalWidth == null) {
+          widget.image.naturalWidth = nw;
+          widget.image.naturalHeight = nh;
+          widget.image.aspectRatio = ar;
+          shouldUpdate = true;
+        }
+
+        // If the container was created with default width (e.g. 340) but screenshot is narrow:
+        if (widget.image.width >= 320.0 && nw < widget.image.width) {
+          widget.image.width = max(80.0, nw);
+          widget.image.height = widget.image.width / ar;
+          shouldUpdate = true;
+        } else if (widget.image.height == null) {
+          widget.image.height = widget.image.width / ar;
+          shouldUpdate = true;
+        }
+
+        if (shouldUpdate) {
+          setState(() {});
+          widget.onDimensionsResolved?.call();
+        }
+      }
+    }, onError: (_, __) {});
+    stream.addListener(listener);
+  }
 
   void _showContextMenu(
       TapDownDetails details, String imageSource, Widget imageWidget) async {
@@ -1712,6 +1802,41 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
             ],
           ),
         ),
+        const PopupMenuDivider(height: 1),
+        const PopupMenuItem<String>(
+          value: 'zoom_in',
+          height: 36,
+          child: Row(
+            children: [
+              Icon(Icons.zoom_in_rounded, size: 16),
+              SizedBox(width: 8),
+              Text('Увеличить (+15%)', style: TextStyle(fontSize: 13)),
+            ],
+          ),
+        ),
+        const PopupMenuItem<String>(
+          value: 'zoom_out',
+          height: 36,
+          child: Row(
+            children: [
+              Icon(Icons.zoom_out_rounded, size: 16),
+              SizedBox(width: 8),
+              Text('Уменьшить (-15%)', style: TextStyle(fontSize: 13)),
+            ],
+          ),
+        ),
+        const PopupMenuItem<String>(
+          value: 'zoom_reset',
+          height: 36,
+          child: Row(
+            children: [
+              Icon(Icons.aspect_ratio_rounded, size: 16),
+              SizedBox(width: 8),
+              Text('Оригинальный размер (100%)', style: TextStyle(fontSize: 13)),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(height: 1),
         const PopupMenuItem<String>(
           value: 'view',
           height: 36,
@@ -1747,6 +1872,12 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
       widget.onCopy(imageSource);
     } else if (selected == 'copy_link') {
       Clipboard.setData(ClipboardData(text: imageSource));
+    } else if (selected == 'zoom_in') {
+      widget.onScaleStep(1.15);
+    } else if (selected == 'zoom_out') {
+      widget.onScaleStep(1 / 1.15);
+    } else if (selected == 'zoom_reset') {
+      widget.onResetScale();
     } else if (selected == 'delete') {
       widget.onDelete();
     } else if (selected == 'view') {
@@ -1758,7 +1889,11 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
     final imageSource = widget.image.url;
     final cachedBytes = AppImageCache.get(imageSource);
     if (cachedBytes != null) {
-      return Image.memory(cachedBytes, fit: BoxFit.contain);
+      return Image.memory(
+        cachedBytes,
+        fit: BoxFit.cover,
+        filterQuality: FilterQuality.high,
+      );
     } else if (imageSource.startsWith('data:image/') ||
         imageSource.contains('base64')) {
       final base64String =
@@ -1766,18 +1901,22 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
       try {
         final decoded = base64Decode(base64String);
         AppImageCache.put(imageSource, decoded);
-        return Image.memory(decoded, fit: BoxFit.contain);
+        return Image.memory(
+          decoded,
+          fit: BoxFit.cover,
+          filterQuality: FilterQuality.high,
+        );
       } catch (_) {
         return const Icon(Icons.broken_image_rounded, size: 40);
       }
     } else {
       return Image.network(
         imageSource,
-        fit: BoxFit.contain,
+        fit: BoxFit.cover,
+        filterQuality: FilterQuality.high,
         loadingBuilder: (context, child, loadingProgress) {
           if (loadingProgress == null) return child;
           return Container(
-            height: 160,
             alignment: Alignment.center,
             child: SizedBox(
               width: 20,
@@ -1812,6 +1951,11 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
 
     final cardBg = isDark ? const Color(0xFF16181D) : Colors.white;
 
+    final ar = widget.image.aspectRatio;
+    final displayHeight = (widget.image.height != null && widget.image.height! > 0)
+        ? widget.image.height!
+        : ((ar != null && ar > 0) ? (widget.image.width / ar) : null);
+
     return MouseRegion(
       cursor:
           _isDragging ? SystemMouseCursors.grabbing : SystemMouseCursors.grab,
@@ -1842,6 +1986,7 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
           duration: const Duration(milliseconds: 140),
           curve: Curves.easeOutCubic,
           width: widget.image.width,
+          height: displayHeight,
           decoration: BoxDecoration(
             color: cardBg,
             borderRadius: BorderRadius.circular(12),
@@ -1859,11 +2004,16 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
             ],
           ),
           child: Stack(
+            fit: displayHeight != null ? StackFit.expand : StackFit.loose,
             children: [
-              // Image content
+              // Image content edge-to-edge with no empty space
               ClipRRect(
                 borderRadius: BorderRadius.circular(11),
-                child: imageWidget,
+                child: SizedBox(
+                  width: widget.image.width,
+                  height: displayHeight,
+                  child: imageWidget,
+                ),
               ),
 
               // Floating Controls Bar on Hover / Drag
@@ -1877,7 +2027,7 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
                     padding:
                         const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
                     decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.78),
+                      color: Colors.black.withOpacity(0.80),
                       borderRadius: BorderRadius.circular(8),
                       border: Border.all(
                         color: Colors.white.withOpacity(0.18),
@@ -1893,22 +2043,89 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
                           color: Colors.white70,
                         ),
                         const SizedBox(width: 6),
-                        GestureDetector(
-                          onTap: () => widget.onShowLightbox(
-                              widget.image.url, imageWidget),
-                          child: const Icon(
-                            Icons.fullscreen_rounded,
-                            size: 16,
-                            color: Colors.white70,
+                        // Scale Down (-)
+                        Tooltip(
+                          message: 'Уменьшить (-15%)',
+                          child: InkWell(
+                            onTap: () => widget.onScaleStep(1 / 1.15),
+                            borderRadius: BorderRadius.circular(4),
+                            child: const Padding(
+                              padding: EdgeInsets.all(2),
+                              child: Icon(
+                                Icons.remove_rounded,
+                                size: 14,
+                                color: Colors.white70,
+                              ),
+                            ),
                           ),
                         ),
-                        const SizedBox(width: 6),
-                        GestureDetector(
-                          onTap: () => widget.onDelete(),
-                          child: const Icon(
-                            Icons.close_rounded,
-                            size: 15,
-                            color: Colors.white70,
+                        const SizedBox(width: 4),
+                        // Scale Up (+)
+                        Tooltip(
+                          message: 'Увеличить (+15%)',
+                          child: InkWell(
+                            onTap: () => widget.onScaleStep(1.15),
+                            borderRadius: BorderRadius.circular(4),
+                            child: const Padding(
+                              padding: EdgeInsets.all(2),
+                              child: Icon(
+                                Icons.add_rounded,
+                                size: 14,
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        // Reset to 1:1 original size
+                        Tooltip(
+                          message: 'Оригинальный размер (100%)',
+                          child: InkWell(
+                            onTap: () => widget.onResetScale(),
+                            borderRadius: BorderRadius.circular(4),
+                            child: const Padding(
+                              padding: EdgeInsets.all(2),
+                              child: Icon(
+                                Icons.aspect_ratio_rounded,
+                                size: 13,
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 5),
+                        Container(width: 1, height: 12, color: Colors.white24),
+                        const SizedBox(width: 5),
+                        Tooltip(
+                          message: 'На весь экран',
+                          child: InkWell(
+                            onTap: () => widget.onShowLightbox(
+                                widget.image.url, imageWidget),
+                            borderRadius: BorderRadius.circular(4),
+                            child: const Padding(
+                              padding: EdgeInsets.all(2),
+                              child: Icon(
+                                Icons.fullscreen_rounded,
+                                size: 15,
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Tooltip(
+                          message: 'Удалить',
+                          child: InkWell(
+                            onTap: () => widget.onDelete(),
+                            borderRadius: BorderRadius.circular(4),
+                            child: const Padding(
+                              padding: EdgeInsets.all(2),
+                              child: Icon(
+                                Icons.close_rounded,
+                                size: 15,
+                                color: Colors.white70,
+                              ),
+                            ),
                           ),
                         ),
                       ],
@@ -1917,7 +2134,7 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
                 ),
               ),
 
-              // Resize Handle in bottom-right corner
+              // Resize Handle in bottom-right corner with aspect-ratio diagonal grip
               Positioned(
                 bottom: 0,
                 right: 0,
@@ -1926,21 +2143,33 @@ class _CanvasImageWidgetState extends State<_CanvasImageWidget> {
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onPanUpdate: (details) {
-                      widget.onResize(details.delta.dx);
+                      widget.onResize(details.delta);
                     },
                     onPanEnd: (_) => widget.onDragEnd(),
                     child: Container(
-                      width: 24,
-                      height: 24,
+                      width: 28,
+                      height: 28,
                       alignment: Alignment.bottomRight,
-                      padding: const EdgeInsets.only(right: 3, bottom: 3),
+                      padding: const EdgeInsets.only(right: 4, bottom: 4),
                       child: AnimatedOpacity(
                         duration: const Duration(milliseconds: 160),
-                        opacity: (_isHovered || _isDragging) ? 0.9 : 0.3,
-                        child: Icon(
-                          Icons.south_east_rounded,
-                          size: 13,
-                          color: isDark ? Colors.white70 : Colors.black54,
+                        opacity: (_isHovered || _isDragging) ? 0.95 : 0.35,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: (_isHovered || _isDragging)
+                                ? Colors.black.withOpacity(0.65)
+                                : Colors.transparent,
+                            borderRadius: const BorderRadius.only(
+                              topLeft: Radius.circular(6),
+                              bottomRight: Radius.circular(10),
+                            ),
+                          ),
+                          padding: const EdgeInsets.all(2),
+                          child: Icon(
+                            Icons.south_east_rounded,
+                            size: 14,
+                            color: isDark ? Colors.white70 : Colors.black54,
+                          ),
                         ),
                       ),
                     ),
@@ -2257,6 +2486,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
       _lastSavedContent = widget.note.content;
 
       Document newDoc;
+      List<CanvasImage> loadedImages = [];
       if (widget.note.content.isNotEmpty) {
         try {
           final decoded = jsonDecode(widget.note.content);
@@ -2264,6 +2494,12 @@ class _NoteEditorViewState extends State<NoteEditorView>
             newDoc = Document.fromJson(decoded);
           } else if (decoded is Map && decoded['delta'] is List) {
             newDoc = Document.fromJson(decoded['delta']);
+            if (decoded['images'] is List) {
+              loadedImages = (decoded['images'] as List)
+                  .map((e) =>
+                      CanvasImage.fromJson(Map<String, dynamic>.from(e)))
+                  .toList();
+            }
           } else {
             newDoc = Document();
           }
@@ -2273,6 +2509,7 @@ class _NoteEditorViewState extends State<NoteEditorView>
       } else {
         newDoc = Document();
       }
+      _canvasImages = loadedImages;
       _setQuillDocument(newDoc);
       _quillController.updateSelection(
         const TextSelection.collapsed(offset: 0),
@@ -2318,6 +2555,12 @@ class _NoteEditorViewState extends State<NoteEditorView>
                 newDoc = Document.fromJson(decoded);
               } else if (decoded is Map && decoded['delta'] is List) {
                 newDoc = Document.fromJson(decoded['delta']);
+                if (decoded['images'] is List) {
+                  _canvasImages = (decoded['images'] as List)
+                      .map((e) =>
+                          CanvasImage.fromJson(Map<String, dynamic>.from(e)))
+                      .toList();
+                }
               } else {
                 newDoc = Document();
               }
@@ -2524,21 +2767,27 @@ class _NoteEditorViewState extends State<NoteEditorView>
 
   Future<Uint8List> _optimizeImageBytes(Uint8List bytes) async {
     try {
+      // Retain 100% original lossless quality for screenshots and images under 3MB
+      if (bytes.length < 3 * 1024 * 1024) {
+        return bytes;
+      }
       final decoded = img.decodeImage(bytes);
       if (decoded == null) return bytes;
 
-      const maxDim = 1400;
+      const maxDim = 2560; // Crisp 2K/Retina sharpness
       img.Image resized = decoded;
       if (decoded.width > maxDim || decoded.height > maxDim) {
         if (decoded.width > decoded.height) {
-          resized = img.copyResize(decoded, width: maxDim);
+          resized = img.copyResize(decoded,
+              width: maxDim, interpolation: img.Interpolation.linear);
         } else {
-          resized = img.copyResize(decoded, height: maxDim);
+          resized = img.copyResize(decoded,
+              height: maxDim, interpolation: img.Interpolation.linear);
         }
       }
 
-      final compressed = img.encodeJpg(resized, quality: 82);
-      if (compressed.isNotEmpty) {
+      final compressed = img.encodeJpg(resized, quality: 92);
+      if (compressed.isNotEmpty && compressed.length < bytes.length) {
         return Uint8List.fromList(compressed);
       }
     } catch (e) {
@@ -2693,9 +2942,55 @@ class _NoteEditorViewState extends State<NoteEditorView>
     try {
       final optimized = await _optimizeImageBytes(bytes);
       final tempBase64 = base64Encode(optimized);
-      final localDataUrl = 'data:image/jpeg;base64,$tempBase64';
+      final isPng = optimized.length > 8 &&
+          optimized[0] == 0x89 &&
+          optimized[1] == 0x50 &&
+          optimized[2] == 0x4E &&
+          optimized[3] == 0x47;
+      final mime = isPng ? 'image/png' : 'image/jpeg';
+      final localDataUrl = 'data:$mime;base64,$tempBase64';
 
       AppImageCache.put(localDataUrl, optimized);
+
+      // Extract natural dimensions and aspect ratio
+      double? naturalWidth;
+      double? naturalHeight;
+      double? ar;
+
+      try {
+        final codec = await instantiateImageCodec(optimized);
+        final frame = await codec.getNextFrame();
+        final nw = frame.image.width.toDouble();
+        final nh = frame.image.height.toDouble();
+        if (nw > 0 && nh > 0) {
+          naturalWidth = nw;
+          naturalHeight = nh;
+          ar = nw / nh;
+        }
+      } catch (_) {
+        try {
+          final decoded = img.decodeImage(optimized);
+          if (decoded != null && decoded.width > 0 && decoded.height > 0) {
+            naturalWidth = decoded.width.toDouble();
+            naturalHeight = decoded.height.toDouble();
+            ar = naturalWidth! / naturalHeight!;
+          }
+        } catch (_) {}
+      }
+
+      double initWidth;
+      if (naturalWidth != null && naturalWidth! > 0) {
+        if (naturalWidth! < 340.0) {
+          // Narrow screenshot (e.g. 150px wide) - fit exact natural width with zero extra space!
+          initWidth = max(80.0, naturalWidth!);
+        } else {
+          initWidth = 360.0;
+        }
+      } else {
+        initWidth = 320.0;
+      }
+
+      final initHeight = (ar != null && ar > 0) ? (initWidth / ar) : null;
 
       final imgId = 'img_${DateTime.now().millisecondsSinceEpoch}';
       final currentScroll = _editorScrollController.hasClients
@@ -2707,7 +3002,11 @@ class _NoteEditorViewState extends State<NoteEditorView>
         url: localDataUrl,
         x: 20.0,
         y: currentScroll + 20.0,
-        width: 340.0,
+        width: initWidth,
+        height: initHeight,
+        naturalWidth: naturalWidth,
+        naturalHeight: naturalHeight,
+        aspectRatio: ar,
       );
 
       setState(() {
@@ -3120,11 +3419,58 @@ class _NoteEditorViewState extends State<NoteEditorView>
           _saveNote(force: true);
           widget.onBroadcastSync?.call();
         },
-        onResize: (deltaWidth) {
+        onResize: (delta) {
           setState(() {
-            img.width = (img.width + deltaWidth).clamp(160.0, availableWidth);
+            final ar = img.aspectRatio ??
+                ((img.height != null && img.height! > 0)
+                    ? (img.width / img.height!)
+                    : 1.0);
+            final diagonalProj = (delta.dx * ar + delta.dy) / (ar * ar + 1.0);
+            final deltaW = diagonalProj * ar;
+
+            final minW = max(80.0, min(140.0, availableWidth * 0.2));
+            final maxW = availableWidth;
+
+            final newWidth = (img.width + deltaW).clamp(minW, maxW);
+            img.width = newWidth;
+            img.height = newWidth / ar;
             img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
           });
+        },
+        onScaleStep: (factor) {
+          setState(() {
+            final ar = img.aspectRatio ??
+                ((img.height != null && img.height! > 0)
+                    ? (img.width / img.height!)
+                    : 1.0);
+            final minW = max(80.0, min(140.0, availableWidth * 0.2));
+            final maxW = availableWidth;
+
+            final newWidth = (img.width * factor).clamp(minW, maxW);
+            img.width = newWidth;
+            img.height = newWidth / ar;
+            img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
+          });
+          _lastLocalEditTime = DateTime.now();
+          _saveNote(force: true);
+          widget.onBroadcastSync?.call();
+        },
+        onResetScale: () {
+          setState(() {
+            final ar = img.aspectRatio ??
+                ((img.height != null && img.height! > 0)
+                    ? (img.width / img.height!)
+                    : 1.0);
+            final targetW = (img.naturalWidth != null && img.naturalWidth! > 0)
+                ? img.naturalWidth!.clamp(80.0, availableWidth)
+                : 320.0;
+            img.width = targetW;
+            img.height = targetW / ar;
+            img.x = img.x.clamp(0.0, max(0.0, availableWidth - img.width));
+          });
+          _lastLocalEditTime = DateTime.now();
+          _saveNote(force: true);
+          widget.onBroadcastSync?.call();
         },
         onDelete: () {
           setState(() {
@@ -3139,6 +3485,10 @@ class _NoteEditorViewState extends State<NoteEditorView>
         },
         onShowLightbox: (src, imageWidget) {
           ImageActions.showLightbox(context, imageWidget, src);
+        },
+        onDimensionsResolved: () {
+          _saveNote(force: true);
+          widget.onBroadcastSync?.call();
         },
       ),
     );

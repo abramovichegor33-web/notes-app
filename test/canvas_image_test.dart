@@ -11,6 +11,9 @@ void main() {
       y: 280.0,
       width: 320.0,
       height: 240.0,
+      naturalWidth: 640.0,
+      naturalHeight: 480.0,
+      aspectRatio: 640.0 / 480.0,
     );
 
     final json = img.toJson();
@@ -20,6 +23,9 @@ void main() {
     expect(json['y'], equals(280.0));
     expect(json['width'], equals(320.0));
     expect(json['height'], equals(240.0));
+    expect(json['naturalWidth'], equals(640.0));
+    expect(json['naturalHeight'], equals(480.0));
+    expect(json['aspectRatio'], equals(640.0 / 480.0));
 
     final parsed = CanvasImage.fromJson(json);
     expect(parsed.id, equals(img.id));
@@ -28,6 +34,44 @@ void main() {
     expect(parsed.y, equals(img.y));
     expect(parsed.width, equals(img.width));
     expect(parsed.height, equals(img.height));
+    expect(parsed.naturalWidth, equals(img.naturalWidth));
+    expect(parsed.naturalHeight, equals(img.naturalHeight));
+    expect(parsed.aspectRatio, equals(img.aspectRatio));
+  });
+
+  test('CanvasImage strictly preserves aspect ratio when scaled', () {
+    final narrowScreenshot = CanvasImage(
+      id: 'img_narrow',
+      url: 'https://example.com/narrow.png',
+      x: 20.0,
+      y: 30.0,
+      width: 150.0,
+      height: 450.0,
+      naturalWidth: 150.0,
+      naturalHeight: 450.0,
+      aspectRatio: 150.0 / 450.0, // 1/3
+    );
+
+    final ar = narrowScreenshot.aspectRatio!;
+    expect(ar, closeTo(0.3333, 0.001));
+
+    // Scale up by factor 1.15 (+15%)
+    final scaledWidth = narrowScreenshot.width * 1.15;
+    final scaledHeight = scaledWidth / ar;
+    narrowScreenshot.width = scaledWidth;
+    narrowScreenshot.height = scaledHeight;
+
+    expect(narrowScreenshot.width / narrowScreenshot.height!, closeTo(ar, 0.0001));
+
+    // Scale down by factor 1 / 1.15 (-15%)
+    final downWidth = narrowScreenshot.width / 1.15;
+    final downHeight = downWidth / ar;
+    narrowScreenshot.width = downWidth;
+    narrowScreenshot.height = downHeight;
+
+    expect(narrowScreenshot.width, closeTo(150.0, 0.001));
+    expect(narrowScreenshot.height!, closeTo(450.0, 0.001));
+    expect(narrowScreenshot.width / narrowScreenshot.height!, closeTo(ar, 0.0001));
   });
 
   test('Note content parsing supports both legacy delta and canvas images format', () {
