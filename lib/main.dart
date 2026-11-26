@@ -137,7 +137,7 @@ class _NotesAppState extends State<NotesApp> {
         }
 
         return MaterialApp(
-          title: 'Заметки',
+          title: 'FlowNote',
           debugShowCheckedModeBanner: false,
           localizationsDelegates: const [
             GlobalMaterialLocalizations.delegate,

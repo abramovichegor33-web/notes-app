@@ -295,7 +295,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUI
             backing: .buffered,
             defer: false
         )
-        window.title = "Заметки"
+        window.title = "FlowNote"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.minSize = NSSize(width: 600, height: 450)
@@ -509,12 +509,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUI
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
         appMenuItem.submenu = appMenu
-        appMenu.addItem(withTitle: "О программе Заметки", action: nil, keyEquivalent: "")
+        appMenu.addItem(withTitle: "О программе FlowNote", action: nil, keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "Скрыть Заметки", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Скрыть FlowNote", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(withTitle: "Скрыть остальные", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "Завершить Заметки", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Завершить FlowNote", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
         // Меню Файл
         let fileMenuItem = NSMenuItem()

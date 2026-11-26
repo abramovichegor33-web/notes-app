@@ -139,7 +139,7 @@ func main() {
 		DataPath:  dataPath,
 		AutoFocus: true,
 		WindowOptions: webview2.WindowOptions{
-			Title:  "Заметки",
+			Title:  "FlowNote",
 			Width:  1160,
 			Height: 760,
 			Center: true,

@@ -1,10 +1,10 @@
 #!/bin/bash
 set -e
 
-APP_NAME="Заметки"
+APP_NAME="FlowNote"
 BUILD_DIR="/tmp/notes_dmg_build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
-DMG_PATH="/Users/egor/.gemini/antigravity/scratch/my_notes/Notes-v1.0.0.dmg"
+DMG_PATH="/Users/egor/.gemini/antigravity/scratch/my_notes/FlowNote-v1.1.0.dmg"
 
 rm -rf "$BUILD_DIR" "$DMG_PATH"
 mkdir -p "$APP_DIR/Contents/MacOS"
@@ -33,13 +33,13 @@ cat << 'EOF' > "$APP_DIR/Contents/Info.plist"
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Заметки</string>
+    <string>FlowNote</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>1.1.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>

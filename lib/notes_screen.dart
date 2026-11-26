@@ -675,7 +675,7 @@ class _NotesScreenState extends State<NotesScreen> with WidgetsBindingObserver {
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                'Заметки',
+                'FlowNote',
                 style: TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.w700,

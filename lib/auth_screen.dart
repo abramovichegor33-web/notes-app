@@ -93,7 +93,7 @@ class _AuthScreenState extends State<AuthScreen> {
                     ),
                     const SizedBox(height: 16),
                     Text(
-                      _isSignUp ? 'Регистрация' : 'Вход в Заметки',
+                      _isSignUp ? 'Регистрация' : 'Вход в FlowNote',
                       textAlign: TextAlign.center,
                       style: theme.textTheme.headlineSmall?.copyWith(
                         fontWeight: FontWeight.bold,
