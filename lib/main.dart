@@ -4,6 +4,7 @@ import 'package:flutter_quill/flutter_quill.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'notes_screen.dart';
 import 'vault_service.dart';
+import 'web_paste.dart';
 
 const String supabaseUrl = 'https://fvkbsnzvluhnxsbzeivy.supabase.co';
 const String supabaseAnonKey =
@@ -35,6 +36,7 @@ class NotesApp extends StatefulWidget {
 
 class _NotesAppState extends State<NotesApp> {
   String? _vaultId;
+  bool? _lastSyncedDark;
 
   @override
   void initState() {
@@ -52,9 +54,18 @@ class _NotesAppState extends State<NotesApp> {
   @override
   Widget build(BuildContext context) {
     const accentColor = Color(0xFF6366F1);
+    const fontFallback = <String>[
+      'Inter',
+      'SF Pro Text',
+      '-apple-system',
+      'Segoe UI',
+      'Roboto',
+      'sans-serif',
+    ];
 
     final darkTheme = ThemeData(
       brightness: Brightness.dark,
+      fontFamilyFallback: fontFallback,
       scaffoldBackgroundColor: const Color(0xFF0D0E10), // Base dark canvas
       canvasColor: const Color(0xFF0D0E10),
       cardColor: const Color(0xFF141518), // Floating editor card sheet
@@ -83,6 +94,7 @@ class _NotesAppState extends State<NotesApp> {
 
     final lightTheme = ThemeData(
       brightness: Brightness.light,
+      fontFamilyFallback: fontFallback,
       scaffoldBackgroundColor: const Color(0xFFF0F1F4), // Base light canvas
       canvasColor: const Color(0xFFF0F1F4),
       cardColor: const Color(0xFFFFFFFF), // Floating editor card sheet
@@ -112,6 +124,18 @@ class _NotesAppState extends State<NotesApp> {
     return ValueListenableBuilder<ThemeMode>(
       valueListenable: appThemeModeNotifier,
       builder: (context, themeMode, _) {
+        final systemDark =
+            WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+                Brightness.dark;
+        final isDark = themeMode == ThemeMode.dark ||
+            (themeMode == ThemeMode.system && systemDark);
+        if (_lastSyncedDark != isDark) {
+          _lastSyncedDark = isDark;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            syncNativeWindowTheme(isDark);
+          });
+        }
+
         return MaterialApp(
           title: 'Заметки',
           debugShowCheckedModeBanner: false,

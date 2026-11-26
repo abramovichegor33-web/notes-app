@@ -10,9 +10,46 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"unsafe"
 
 	"github.com/jchv/go-webview2"
 )
+
+var (
+	dwmapi                = syscall.NewLazyDLL("dwmapi.dll")
+	dwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
+)
+
+func applyWindowsTitlebarTheme(hwnd uintptr, isDark bool) {
+	if hwnd == 0 {
+		return
+	}
+	var darkFlag int32
+	var captionColor uint32
+	var textColor uint32
+	var borderColor uint32
+
+	if isDark {
+		darkFlag = 1
+		captionColor = 0x00100E0D // #0D0E10 (COLORREF: 0x00BBGGRR)
+		textColor = 0x00EFEDED    // #EDEDEF
+		borderColor = 0x0026201E  // #1E2026
+	} else {
+		darkFlag = 0
+		captionColor = 0x00F4F1F0 // #F0F1F4
+		textColor = 0x001E1B1A    // #1A1B1E
+		borderColor = 0x00E8E3E1  // #E1E3E8
+	}
+
+	// DWMWA_USE_IMMERSIVE_DARK_MODE (Windows 11 / 20H1+: 20, older Win10: 19)
+	_, _, _ = dwmSetWindowAttribute.Call(hwnd, 20, uintptr(unsafe.Pointer(&darkFlag)), unsafe.Sizeof(darkFlag))
+	_, _, _ = dwmSetWindowAttribute.Call(hwnd, 19, uintptr(unsafe.Pointer(&darkFlag)), unsafe.Sizeof(darkFlag))
+	// Windows 11 caption/text/border seamless colors
+	_, _, _ = dwmSetWindowAttribute.Call(hwnd, 35, uintptr(unsafe.Pointer(&captionColor)), unsafe.Sizeof(captionColor))
+	_, _, _ = dwmSetWindowAttribute.Call(hwnd, 36, uintptr(unsafe.Pointer(&textColor)), unsafe.Sizeof(textColor))
+	_, _, _ = dwmSetWindowAttribute.Call(hwnd, 34, uintptr(unsafe.Pointer(&borderColor)), unsafe.Sizeof(borderColor))
+}
 
 //go:embed web/*
 var webFiles embed.FS
@@ -115,6 +152,12 @@ func main() {
 	defer w.Destroy()
 
 	w.SetSize(1160, 760, webview2.HintNone)
+	applyWindowsTitlebarTheme(uintptr(w.Window()), true)
+	_ = w.Bind("setNativeTheme", func(isDark bool) {
+		w.Dispatch(func() {
+			applyWindowsTitlebarTheme(uintptr(w.Window()), isDark)
+		})
+	})
 
 	// 5. Переход на встроенное веб-приложение
 	url := fmt.Sprintf("http://127.0.0.1:%d/index.html", port)

@@ -82,6 +82,31 @@ class Note {
     };
   }
 
+  late final ({int images, int files}) _attachmentCounts =
+      _computeAttachmentCounts(content);
+
+  int get imageCount => _attachmentCounts.images;
+  int get fileCount => _attachmentCounts.files;
+
+  static ({int images, int files}) _computeAttachmentCounts(String rawContent) {
+    if (rawContent.isEmpty ||
+        (!rawContent.contains('"images"') && !rawContent.contains('"files"'))) {
+      return (images: 0, files: 0);
+    }
+    try {
+      final decoded = jsonDecode(rawContent);
+      if (decoded is Map) {
+        final imgs = decoded['images'] is List
+            ? (decoded['images'] as List).length
+            : 0;
+        final files =
+            decoded['files'] is List ? (decoded['files'] as List).length : 0;
+        return (images: imgs, files: files);
+      }
+    } catch (_) {}
+    return (images: 0, files: 0);
+  }
+
   String get formattedDate {
     final now = DateTime.now();
     final local = updatedAt.toLocal();

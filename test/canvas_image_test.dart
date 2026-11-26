@@ -286,4 +286,137 @@ void main() {
     expect(loaded.first.id, equals('n1'));
     expect(loaded.first.isPinned, isTrue);
   });
+
+  test('computeCanvasSnap snaps to center, edges, and sibling images cleanly', () {
+    final sibling = CanvasImage(
+      id: 'sib',
+      url: 'https://example.com/sib.png',
+      x: 40.0,
+      y: 120.0,
+      width: 200.0,
+      height: 150.0,
+    );
+
+    // 1. Center snap on 700px wide sheet for 200px image -> targetX = 250.0, guideX = 350.0
+    final centerSnap = computeCanvasSnap(
+      rawX: 254.0,
+      rawY: 20.0,
+      imageWidth: 200.0,
+      imageHeight: 100.0,
+      availableWidth: 700.0,
+      otherImages: [sibling],
+    );
+    expect(centerSnap.x, equals(250.0));
+    expect(centerSnap.guideX, equals(350.0));
+    expect(centerSnap.guideY, isNull);
+
+    // 2. Sibling alignment snap (x near 40.0, y near 120.0)
+    final sibSnap = computeCanvasSnap(
+      rawX: 43.0,
+      rawY: 116.0,
+      imageWidth: 160.0,
+      imageHeight: 120.0,
+      availableWidth: 700.0,
+      otherImages: [sibling],
+    );
+    expect(sibSnap.x, equals(40.0));
+    expect(sibSnap.y, equals(120.0));
+    expect(sibSnap.guideX, equals(40.0));
+    expect(sibSnap.guideY, equals(120.0));
+
+    // 3. Outside threshold -> no snap, no guide lines
+    final freePos = computeCanvasSnap(
+      rawX: 110.0,
+      rawY: 200.0,
+      imageWidth: 160.0,
+      imageHeight: 120.0,
+      availableWidth: 700.0,
+      otherImages: [sibling],
+    );
+    expect(freePos.x, equals(110.0));
+    expect(freePos.y, equals(200.0));
+    expect(freePos.guideX, isNull);
+    expect(freePos.guideY, isNull);
+  });
+
+  test('Note.imageCount reports canvas images count accurately', () {
+    final emptyNote = Note(
+      id: 'n_empty',
+      vaultId: 'V',
+      title: 'Empty',
+      content: jsonEncode({'delta': [], 'images': []}),
+      plainText: '',
+      updatedAt: DateTime.now(),
+    );
+    expect(emptyNote.imageCount, equals(0));
+
+    final imgNote = Note(
+      id: 'n_imgs',
+      vaultId: 'V',
+      title: 'With Images',
+      content: jsonEncode({
+        'delta': [],
+        'images': [
+          {'id': '1', 'url': 'https://example.com/1.png', 'x': 0, 'y': 0, 'width': 120},
+          {'id': '2', 'url': 'https://example.com/2.png', 'x': 20, 'y': 20, 'width': 140},
+        ],
+      }),
+      plainText: '',
+      updatedAt: DateTime.now(),
+    );
+    expect(imgNote.imageCount, equals(2));
+  });
+
+  test('CanvasFile serialization, helpers, encodeNoteContent, and parseNoteContent roundtrip', () {
+    expect(sanitizeStorageFileName('Отчёт 2026 #final!.PDF'), equals('2026_final.pdf'));
+    expect(sanitizeStorageFileName('Только кириллица.txt'), equals('file.txt'));
+    expect(formatFileSize(512), equals('512 Б'));
+    expect(formatFileSize(2048), equals('2 КБ'));
+    expect(formatFileSize(1572864), equals('1.5 МБ'));
+    expect(mimeTypeForExtension('pdf'), equals('application/pdf'));
+    expect(mimeTypeForExtension('unknown'), equals('application/octet-stream'));
+
+    final uploaded = CanvasFile(
+      id: 'f1',
+      name: 'Отчёт.pdf',
+      url: 'https://fvkbsnzvluhnxsbzeivy.supabase.co/storage/v1/object/public/note-images/V3X-EGF/files/123_report.pdf',
+      size: 204800,
+      ext: 'pdf',
+    );
+    final pending = CanvasFile(
+      id: 'f2',
+      name: 'pending.zip',
+      url: '',
+      size: 1024,
+      ext: 'zip',
+      isUploading: true,
+    );
+
+    final encoded = encodeNoteContent(
+      delta: [
+        {'insert': 'Notes with attachment\n'}
+      ],
+      images: const [],
+      files: [uploaded, pending],
+      isPinned: true,
+    );
+
+    final parsed = parseNoteContent(encoded);
+    expect(parsed.isPinned, isTrue);
+    expect(parsed.files.length, equals(1)); // Pending file excluded safely
+    expect(parsed.files.first.name, equals('Отчёт.pdf'));
+    expect(parsed.files.first.size, equals(204800));
+    expect(parsed.files.first.ext, equals('pdf'));
+
+    final note = Note(
+      id: 'n_file',
+      vaultId: 'V',
+      title: 'With File',
+      content: encoded,
+      plainText: 'Notes with attachment',
+      updatedAt: DateTime.now(),
+    );
+    expect(note.fileCount, equals(1));
+    expect(note.imageCount, equals(0));
+  });
 }

@@ -18,9 +18,83 @@
 
   <title>Заметки</title>
   <link rel="manifest" href="manifest.json">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background-color: #0D0E10;
+    }
+    @media (prefers-color-scheme: light) {
+      html, body {
+        background-color: #F0F1F4;
+      }
+    }
+  </style>
 </head>
 <body>
   <script>
+    window.syncNotesNativeTheme = function(isDark) {
+      try {
+        var bg = isDark ? '#0D0E10' : '#F0F1F4';
+        document.documentElement.style.backgroundColor = bg;
+        if (document.body) document.body.style.backgroundColor = bg;
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.setThemeAppearance) {
+          window.webkit.messageHandlers.setThemeAppearance.postMessage(isDark ? 'dark' : 'light');
+        }
+        if (typeof window.setNativeTheme === 'function') {
+          window.setNativeTheme(!!isDark);
+        }
+      } catch (_) {}
+    };
+
+    // Скачивание прикреплённых файлов: нативный NSSavePanel на macOS или Blob-загрузка в браузере / Windows WebView2
+    window.saveNotesFile = function(fileName, url, base64Data, mimeType) {
+      try {
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.saveFile) {
+          window.webkit.messageHandlers.saveFile.postMessage({
+            fileName: fileName || 'attachment',
+            url: url || '',
+            base64: base64Data || ''
+          });
+          return true;
+        }
+        if (base64Data) {
+          var clean = base64Data.indexOf(',') !== -1 ? base64Data.split(',')[1] : base64Data;
+          var binary = atob(clean);
+          var bytes = new Uint8Array(binary.length);
+          for (var i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          var blob = new Blob([bytes], { type: mimeType || 'application/octet-stream' });
+          var blobUrl = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = fileName || 'attachment';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(function() { URL.revokeObjectURL(blobUrl); }, 2000);
+          return true;
+        }
+      } catch (err) {
+        console.error('saveNotesFile error:', err);
+      }
+      return false;
+    };
+
+    window.pickNotesFile = function(imagesOnly) {
+      try {
+        var handlerName = imagesOnly ? 'pickImage' : 'pickFile';
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers[handlerName]) {
+          window.webkit.messageHandlers[handlerName].postMessage({});
+          return true;
+        }
+      } catch (err) {
+        console.error('pickNotesFile error:', err);
+      }
+      return false;
+    };
+
     // Блокируем стандартное контекстное меню браузера, чтобы отображалось только наше меню Flutter
     window.addEventListener('contextmenu', function(e) {
       e.preventDefault();
@@ -57,20 +131,64 @@
     };
 
     window.addEventListener('paste', function(e) {
-      if (!e.clipboardData || !e.clipboardData.items) return;
+      if (!e.clipboardData) return;
       var items = e.clipboardData.items;
-      for (var i = 0; i < items.length; i++) {
-        var item = items[i];
-        if (item.type && item.type.indexOf('image') !== -1) {
-          var blob = item.getAsFile();
-          if (blob) {
+      var handledAny = false;
+      var maxBytes = 50 * 1024 * 1024;
+
+      function dispatchRawFile(file) {
+        if (!file) return;
+        if (file.size > maxBytes) {
+          window.dispatchEvent(new CustomEvent('flutter_file_paste', {
+            detail: JSON.stringify({ error: 'too_large', name: file.name || 'file' })
+          }));
+          return;
+        }
+        var reader = new FileReader();
+        reader.onload = function(evt) {
+          var result = evt.target.result || '';
+          var commaIdx = result.indexOf(',');
+          var b64 = commaIdx !== -1 ? result.substring(commaIdx + 1) : result;
+          window.dispatchEvent(new CustomEvent('flutter_file_paste', {
+            detail: JSON.stringify({ name: file.name || 'file', base64: b64 })
+          }));
+        };
+        reader.readAsDataURL(file);
+      }
+
+      if (items && items.length > 0) {
+        for (var i = 0; i < items.length; i++) {
+          var item = items[i];
+          if (item.kind === 'file') {
+            var file = item.getAsFile();
+            if (!file) continue;
+            handledAny = true;
             e.preventDefault();
-            var reader = new FileReader();
-            reader.onload = function(evt) {
+            if (item.type && item.type.indexOf('image/') === 0) {
+              var imgReader = new FileReader();
+              imgReader.onload = function(evt) {
+                window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: evt.target.result }));
+              };
+              imgReader.readAsDataURL(file);
+            } else {
+              dispatchRawFile(file);
+            }
+          }
+        }
+      }
+
+      if (!handledAny && e.clipboardData.files && e.clipboardData.files.length > 0) {
+        e.preventDefault();
+        for (var j = 0; j < e.clipboardData.files.length; j++) {
+          var f = e.clipboardData.files[j];
+          if (f.type && f.type.indexOf('image/') === 0) {
+            var r = new FileReader();
+            r.onload = function(evt) {
               window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: evt.target.result }));
             };
-            reader.readAsDataURL(blob);
-            break;
+            r.readAsDataURL(f);
+          } else {
+            dispatchRawFile(f);
           }
         }
       }

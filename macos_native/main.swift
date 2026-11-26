@@ -155,12 +155,52 @@ class CustomWebView: WKWebView {
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         menu.removeAllItems()
     }
+
+    override func mouseDown(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        let distFromTop = isFlipped ? pt.y : (bounds.height - pt.y)
+        // Верхняя пустая полоса сайдбара (справа от кнопок светофора): перетаскивание окна и двойной клик для зума
+        if distFromTop >= 0 && distFromTop <= 38 && pt.x >= 72 && pt.x <= 270 {
+            if event.clickCount == 2 {
+                window?.performZoom(nil)
+            } else {
+                window?.performDrag(with: event)
+            }
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.control),
+           !event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "v",
+           let appDelegate = NSApp.delegate as? AppDelegate {
+            appDelegate.pasteAction(nil)
+            return
+        }
+        super.keyDown(with: event)
+    }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
+class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDelegate {
     var window: NSWindow!
     var webView: CustomWebView!
     var server: StaticFileServer?
+
+    private func applyWindowTheme(isDark: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let window = self.window else { return }
+            let bgColor = isDark
+                ? NSColor(srgbRed: 13/255.0, green: 14/255.0, blue: 16/255.0, alpha: 1.0)
+                : NSColor(srgbRed: 240/255.0, green: 241/255.0, blue: 244/255.0, alpha: 1.0)
+            window.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
+            window.backgroundColor = bgColor
+            if #available(macOS 12.0, *), let webView = self.webView {
+                webView.underPageBackgroundColor = bgColor
+            }
+        }
+    }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if message.name == "copyImageToClipboard", let base64String = message.body as? String {
@@ -169,6 +209,68 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
                 let pb = NSPasteboard.general
                 pb.clearContents()
                 pb.writeObjects([image])
+            }
+        } else if message.name == "setThemeAppearance", let mode = message.body as? String {
+            applyWindowTheme(isDark: mode == "dark")
+        } else if message.name == "pickFile" {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, let window = self.window else { return }
+                let panel = NSOpenPanel()
+                panel.canChooseFiles = true
+                panel.canChooseDirectories = false
+                panel.allowsMultipleSelection = true
+                panel.beginSheetModal(for: window) { response in
+                    guard response == .OK else { return }
+                    for url in panel.urls {
+                        self.dispatchFileAttachment(from: url)
+                    }
+                }
+            }
+        } else if message.name == "pickImage" {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, let window = self.window else { return }
+                let panel = NSOpenPanel()
+                panel.canChooseFiles = true
+                panel.canChooseDirectories = false
+                panel.allowsMultipleSelection = false
+                panel.allowedFileTypes = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "heic"]
+                panel.beginSheetModal(for: window) { response in
+                    guard response == .OK, let url = panel.urls.first else { return }
+                    if let image = NSImage(contentsOf: url) {
+                        self.dispatchImagePaste(image)
+                    }
+                }
+            }
+        } else if message.name == "saveFile", let dict = message.body as? [String: Any] {
+            let fileName = (dict["fileName"] as? String) ?? "attachment"
+            let urlString = dict["url"] as? String
+            let base64String = dict["base64"] as? String
+
+            DispatchQueue.main.async { [weak self] in
+                guard let window = self?.window else { return }
+                let panel = NSSavePanel()
+                panel.nameFieldStringValue = fileName
+                panel.canCreateDirectories = true
+                if let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first {
+                    panel.directoryURL = downloads
+                }
+                panel.beginSheetModal(for: window) { response in
+                    guard response == .OK, let destUrl = panel.url else { return }
+                    if let b64 = base64String, !b64.isEmpty {
+                        let clean = b64.contains(",") ? String(b64.split(separator: ",")[1]) : b64
+                        if let data = Data(base64Encoded: clean) {
+                            try? data.write(to: destUrl, options: .atomic)
+                            return
+                        }
+                    }
+                    if let uStr = urlString, let remoteUrl = URL(string: uStr) {
+                        URLSession.shared.dataTask(with: remoteUrl) { data, _, _ in
+                            if let data = data {
+                                try? data.write(to: destUrl, options: .atomic)
+                            }
+                        }.resume()
+                    }
+                }
             }
         }
     }
@@ -189,22 +291,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
         let windowRect = NSRect(x: 100, y: 100, width: 1120, height: 760)
         window = NSWindow(
             contentRect: windowRect,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "Заметки"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
         window.minSize = NSSize(width: 600, height: 450)
         window.center()
+
+        let systemDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        applyWindowTheme(isDark: systemDark)
 
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
         let contentController = WKUserContentController()
         contentController.add(self, name: "copyImageToClipboard")
+        contentController.add(self, name: "setThemeAppearance")
+        contentController.add(self, name: "saveFile")
+        contentController.add(self, name: "pickFile")
+        contentController.add(self, name: "pickImage")
+        let titlebarScript = WKUserScript(
+            source: "window.__NOTES_MACOS_TITLEBAR__ = true;",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        contentController.addUserScript(titlebarScript)
         config.userContentController = contentController
 
         webView = CustomWebView(frame: window.contentView!.bounds, configuration: config)
+        webView.uiDelegate = self
         webView.autoresizingMask = [.width, .height]
+        if #available(macOS 12.0, *) {
+            webView.underPageBackgroundColor = systemDark
+                ? NSColor(srgbRed: 13/255.0, green: 14/255.0, blue: 16/255.0, alpha: 1.0)
+                : NSColor(srgbRed: 240/255.0, green: 241/255.0, blue: 244/255.0, alpha: 1.0)
+        }
         window.contentView?.addSubview(webView)
 
         if let url = URL(string: "http://127.0.0.1:\(port)/index.html") {
@@ -221,12 +344,108 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func webView(
+        _ webView: WKWebView,
+        runOpenPanelWith parameters: WKOpenPanelParameters,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping ([URL]?) -> Void
+    ) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.beginSheetModal(for: window) { response in
+            completionHandler(response == .OK ? panel.urls : nil)
+        }
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
     }
 
     private var lastPasteTime: TimeInterval = 0
     private var lastNewNoteTime: TimeInterval = 0
+
+    private func dispatchFileAttachment(from url: URL) {
+        guard url.isFileURL else { return }
+        if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+            return
+        }
+        let maxBytes = 50 * 1024 * 1024
+        if let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, fileSize > maxBytes {
+            if let payloadData = try? JSONSerialization.data(withJSONObject: [
+                "error": "too_large",
+                "name": url.lastPathComponent
+            ]), let jsonStr = String(data: payloadData, encoding: .utf8),
+               let encodedLiteral = try? JSONSerialization.data(withJSONObject: [jsonStr]),
+               let argArray = String(data: encodedLiteral, encoding: .utf8) {
+                let js = "window.dispatchEvent(new CustomEvent('flutter_file_paste', { detail: \(argArray)[0] }));"
+                webView.evaluateJavaScript(js, completionHandler: nil)
+            }
+            return
+        }
+
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return }
+        if data.count > maxBytes { return }
+
+        let payload: [String: Any] = [
+            "name": url.lastPathComponent,
+            "base64": data.base64EncodedString()
+        ]
+        if let payloadData = try? JSONSerialization.data(withJSONObject: payload),
+           let jsonStr = String(data: payloadData, encoding: .utf8),
+           let literalData = try? JSONSerialization.data(withJSONObject: [jsonStr]),
+           let argArray = String(data: literalData, encoding: .utf8) {
+            let js = "window.dispatchEvent(new CustomEvent('flutter_file_paste', { detail: \(argArray)[0] }));"
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    private func dispatchImagePaste(_ image: NSImage) {
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff) else { return }
+        var rep = bitmap
+        let maxWidth: CGFloat = 2560
+        let maxHeight: CGFloat = 2560
+        let width = CGFloat(bitmap.pixelsWide)
+        let height = CGFloat(bitmap.pixelsHigh)
+
+        if width > maxWidth || height > maxHeight {
+            let aspectRatio = width / height
+            var targetWidth = maxWidth
+            var targetHeight = maxWidth / aspectRatio
+            if targetHeight > maxHeight {
+                targetHeight = maxHeight
+                targetWidth = maxHeight * aspectRatio
+            }
+            let newSize = NSSize(width: targetWidth, height: targetHeight)
+            let resizedImg = NSImage(size: newSize)
+            resizedImg.lockFocus()
+            image.draw(in: NSRect(origin: .zero, size: newSize),
+                       from: NSRect(origin: .zero, size: image.size),
+                       operation: .copy,
+                       fraction: 1.0)
+            resizedImg.unlockFocus()
+            if let resTiff = resizedImg.tiffRepresentation,
+               let newRep = NSBitmapImageRep(data: resTiff) {
+                rep = newRep
+            }
+        }
+
+        // Сохраняем PNG без потерь для скриншотов до 3 МБ; для больших фото используем JPEG 0.92
+        if let pngData = rep.representation(using: .png, properties: [:]),
+           pngData.count <= 3 * 1024 * 1024 {
+            let base64 = pngData.base64EncodedString()
+            let dataUrl = "data:image/png;base64,\(base64)"
+            let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        } else if let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92]) {
+            let base64 = jpegData.base64EncodedString()
+            let dataUrl = "data:image/jpeg;base64,\(base64)"
+            let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
 
     @objc func pasteAction(_ sender: Any?) {
         let now = Date().timeIntervalSince1970
@@ -236,64 +455,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
         lastPasteTime = now
 
         let pb = NSPasteboard.general
-        var targetImage: NSImage? = nil
+        let imageExts: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "heic"]
 
-        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil), let image = images.first as? NSImage {
-            targetImage = image
-        } else if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], let url = urls.first {
-            let ext = url.pathExtension.lowercased()
-            if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "heic"].contains(ext) {
-                targetImage = NSImage(contentsOf: url)
+        // Сначала проверяем скопированные файлы из Finder (до NSImage, чтобы вместо документа не вставилась его иконка)
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+            var handled = false
+            for url in urls {
+                let ext = url.pathExtension.lowercased()
+                if imageExts.contains(ext), let image = NSImage(contentsOf: url) {
+                    dispatchImagePaste(image)
+                    handled = true
+                } else {
+                    dispatchFileAttachment(from: url)
+                    handled = true
+                }
             }
+            if handled { return }
         }
 
-        if let image = targetImage {
-            if let tiff = image.tiffRepresentation,
-               let bitmap = NSBitmapImageRep(data: tiff) {
-                var rep = bitmap
-                let maxWidth: CGFloat = 2560
-                let maxHeight: CGFloat = 2560
-                let width = CGFloat(bitmap.pixelsWide)
-                let height = CGFloat(bitmap.pixelsHigh)
-
-                if width > maxWidth || height > maxHeight {
-                    let aspectRatio = width / height
-                    var targetWidth = maxWidth
-                    var targetHeight = maxWidth / aspectRatio
-                    if targetHeight > maxHeight {
-                        targetHeight = maxHeight
-                        targetWidth = maxHeight * aspectRatio
-                    }
-                    let newSize = NSSize(width: targetWidth, height: targetHeight)
-                    let resizedImg = NSImage(size: newSize)
-                    resizedImg.lockFocus()
-                    image.draw(in: NSRect(origin: .zero, size: newSize),
-                               from: NSRect(origin: .zero, size: image.size),
-                               operation: .copy,
-                               fraction: 1.0)
-                    resizedImg.unlockFocus()
-                    if let resTiff = resizedImg.tiffRepresentation,
-                       let newRep = NSBitmapImageRep(data: resTiff) {
-                        rep = newRep
-                    }
-                }
-
-                // Сохраняем PNG без потерь для скриншотов до 3 МБ; для больших фото используем JPEG 0.92
-                if let pngData = rep.representation(using: .png, properties: [:]),
-                   pngData.count <= 3 * 1024 * 1024 {
-                    let base64 = pngData.base64EncodedString()
-                    let dataUrl = "data:image/png;base64,\(base64)"
-                    let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
-                    webView.evaluateJavaScript(js, completionHandler: nil)
-                    return
-                } else if let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92]) {
-                    let base64 = jpegData.base64EncodedString()
-                    let dataUrl = "data:image/jpeg;base64,\(base64)"
-                    let js = "window.dispatchEvent(new CustomEvent('flutter_image_paste', { detail: '\(dataUrl)' }));"
-                    webView.evaluateJavaScript(js, completionHandler: nil)
-                    return
-                }
-            }
+        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil), let image = images.first as? NSImage {
+            dispatchImagePaste(image)
+            return
         }
 
         NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: sender)
@@ -306,6 +488,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
         }
         lastNewNoteTime = now
         let js = "window.dispatchEvent(new CustomEvent('flutter_new_note'));"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    @objc func undoAction(_ sender: Any?) {
+        let js = "window.dispatchEvent(new CustomEvent('flutter_undo'));"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    @objc func redoAction(_ sender: Any?) {
+        let js = "window.dispatchEvent(new CustomEvent('flutter_redo'));"
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
@@ -339,8 +531,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
         mainMenu.addItem(editMenuItem)
         let editMenu = NSMenu(title: "Правка")
         editMenuItem.submenu = editMenu
-        editMenu.addItem(withTitle: "Отменить", action: Selector(("undo:")), keyEquivalent: "z")
-        editMenu.addItem(withTitle: "Повторить", action: Selector(("redo:")), keyEquivalent: "Z")
+        let undoItem = editMenu.addItem(withTitle: "Отменить", action: #selector(undoAction(_:)), keyEquivalent: "z")
+        undoItem.target = self
+        let redoItem = editMenu.addItem(withTitle: "Повторить", action: #selector(redoAction(_:)), keyEquivalent: "Z")
+        redoItem.target = self
         editMenu.addItem(NSMenuItem.separator())
         editMenu.addItem(withTitle: "Вырезать", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Скопировать", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
