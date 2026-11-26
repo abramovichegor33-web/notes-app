@@ -19,7 +19,8 @@ Prebuilt binaries are available in [GitHub Releases](https://github.com/abramovi
 | --- | --- |
 | **macOS** (Apple Silicon) | `FlowNote-v1.1.0.dmg` |
 | **Android** | `FlowNote-v1.1.0.apk` |
-| **Windows** (x64) | `FlowNote-Windows-v1.1.0.zip` |
+| **Windows** (x64 Installer) | `FlowNote-Setup-v1.1.0.exe` |
+| **Windows** (x64 Portable) | `FlowNote-Windows-v1.1.0.zip` |
 | **Web** | `FlowNote-v1.1.0-web.zip` |
 
 ## Development & Verification
